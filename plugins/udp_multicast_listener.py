@@ -273,7 +273,12 @@ class UdpMulticastListener(BaseInboundPlugin):
                     placeholder="10.0.0.5, 10.0.0.6",
                     help_text=(
                         "Optional comma-separated allowlist of source IPs. "
-                        "When set, uses IGMPv3 source-specific multicast."
+                        "When set, uses IGMPv3 source-specific multicast (SSM) — "
+                        "the kernel drops datagrams from any source not listed here "
+                        "before they reach the application. This blocks spoofed or "
+                        "reflected CoT injection from unauthorized senders on the "
+                        "same multicast group. Accepts exact IPv4 addresses only "
+                        "(not CIDRs — SSM is a kernel socket option)."
                     ),
                 ),
                 PluginConfigField(
@@ -364,6 +369,47 @@ class UdpMulticastListener(BaseInboundPlugin):
                 },
             ],
         }
+
+    def validate_config(self) -> bool:
+        if not super().validate_config():
+            return False
+
+        import ipaddress
+
+        group = str(self.config.get("multicast_group", "") or "")
+        if group:
+            try:
+                addr = ipaddress.ip_address(group)
+                if not addr.is_multicast:
+                    logger.error(
+                        f"UDP multicast: multicast_group '{group}' is not "
+                        "a multicast address (224.0.0.0/4)"
+                    )
+                    return False
+            except ValueError:
+                logger.error(
+                    f"UDP multicast: multicast_group '{group}' is not "
+                    "a valid IP address"
+                )
+                return False
+
+        source_filter = str(self.config.get("source_filter") or "")
+        if source_filter.strip():
+            for entry in source_filter.replace(",", "\n").splitlines():
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    ipaddress.ip_address(entry)
+                except ValueError:
+                    logger.error(
+                        f"UDP multicast: source_filter entry '{entry}' "
+                        "is not a valid IPv4 address. SSM requires exact "
+                        "source IPs, not CIDRs."
+                    )
+                    return False
+
+        return True
 
     def transform_payload(self, raw_body, content_type, headers):
         raise NotImplementedError(

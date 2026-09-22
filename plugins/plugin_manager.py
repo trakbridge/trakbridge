@@ -22,6 +22,7 @@ import os
 import pkgutil
 import sys
 from functools import lru_cache
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
 # Local imports for JSON validation
@@ -61,6 +62,12 @@ class PluginManager:
         ] = {}
         self._allowed_modules = self.BUILTIN_PLUGIN_MODULES.copy()
         self._builtin_plugin_names: set = set()
+        # V1/V2: sideloaded unsigned community-tier plugins are refused
+        # by default. Operator opts in via
+        # plugin_settings.allow_community_sideload in plugins.yaml.
+        # Pro/enterprise plugins are never permitted unsigned, regardless
+        # of this flag.
+        self._allow_community_sideload: bool = False
         self._load_allowed_plugins_config()
 
     def _load_allowed_plugins_config(self):
@@ -108,6 +115,20 @@ class PluginManager:
             else:
                 logger.info(
                     "No additional plugin modules configured (using built-in plugins only)"
+                )
+
+            # V1/V2: read the sideload opt-in from plugin_settings.
+            # Absent block or missing key → default False.
+            plugin_settings = (config or {}).get("plugin_settings") or {}
+            allow_sideload = bool(
+                plugin_settings.get("allow_community_sideload", False)
+            )
+            self._allow_community_sideload = allow_sideload
+            if allow_sideload:
+                logger.warning(
+                    "plugin_settings.allow_community_sideload=true — "
+                    "unsigned community-tier plugins in external_plugins/ "
+                    "will be loaded. Pro/enterprise plugins remain refused."
                 )
 
         except Exception as e:
@@ -184,6 +205,8 @@ class PluginManager:
         """
         # Reset to built-in modules
         self._allowed_modules = self.BUILTIN_PLUGIN_MODULES.copy()
+        # Reset sideload flag to default before re-reading
+        self._allow_community_sideload = False
         # Reload from config files
         self._load_allowed_plugins_config()
         logger.info("Plugin configuration reloaded")
@@ -222,6 +245,39 @@ class PluginManager:
                             f"External plugin {module_name} not in allowed list, skipping"
                         )
                         continue
+
+                    # V1/V2 signature gate for loose .py sideloads.
+                    # Loose files have no manifest → treated as
+                    # community-tier for the toggle. Pro/enterprise
+                    # plugins must be shipped as signed packages, not
+                    # loose .py files.
+                    from services.plugin_package_verifier import (
+                        verify_single_file_signature,
+                    )
+
+                    py_full_path = Path(plugins_path) / filename
+                    sig_status = verify_single_file_signature(py_full_path)
+                    if sig_status != "verified":
+                        if self._allow_community_sideload:
+                            logger.warning(
+                                f"Loading UNSIGNED sideloaded plugin "
+                                f"'{filename}' (signature status: "
+                                f"{sig_status}). "
+                                "allow_community_sideload=true — this "
+                                "file is trusted only because the "
+                                "operator opted in."
+                            )
+                        else:
+                            logger.warning(
+                                f"Skipping sideloaded plugin "
+                                f"'{filename}': signature status "
+                                f"{sig_status}. Set "
+                                "plugin_settings.allow_community_sideload"
+                                "=true in config/settings/plugins.yaml "
+                                "to allow unsigned community-tier "
+                                "sideload."
+                            )
+                            continue
 
                     try:
                         # Import the module using spec loading
@@ -342,6 +398,38 @@ class PluginManager:
                         f"'{get_license_service().get_tier()}'"
                     )
                     continue
+
+                # V1/V2 signature gate. Signed → always load. Unsigned or
+                # invalid → depends on tier and the operator opt-in:
+                #   - community + allow_community_sideload=true → load with WARN
+                #   - anything else (pro/enterprise, or toggle off) → skip
+                from services.plugin_package_verifier import (
+                    verify_package_signature,
+                )
+
+                sig_status = verify_package_signature(Path(package_dir))
+                if sig_status != "verified":
+                    tier_lower = str(tier or "community").lower()
+                    if tier_lower == "community" and self._allow_community_sideload:
+                        logger.warning(
+                            f"Loading UNSIGNED community-tier package "
+                            f"plugin '{plugin_id}' from {entry}/ "
+                            f"(signature status: {sig_status}). "
+                            "allow_community_sideload=true — this file "
+                            "is trusted only because the operator opted in."
+                        )
+                    else:
+                        logger.warning(
+                            f"Skipping package plugin '{plugin_id}': "
+                            f"signature status {sig_status}. "
+                            f"Tier '{tier_lower}' requires a valid "
+                            "signature. Set "
+                            "plugin_settings.allow_community_sideload=true "
+                            "in config/settings/plugins.yaml to allow "
+                            "unsigned community-tier plugins (does NOT "
+                            "cover pro/enterprise)."
+                        )
+                        continue
 
                 entry_point = manifest.get("entry_point", "")
                 entry_path = os.path.abspath(os.path.join(package_dir, entry_point))

@@ -139,6 +139,12 @@ class LDAPAuthProvider(BaseAuthenticationProvider):
         if self.ca_cert_file in (None, "", "null"):
             self.ca_cert_file = None
 
+        # T4.1: allow the operator to run LDAP over plaintext, but only
+        # as a deliberate, auditable opt-in. Default False. When True
+        # the validator lets the config through and every startup emits
+        # a WARNING naming the server.
+        self.allow_insecure = bool(config.get("allow_insecure", False))
+
         # Settings
         self.auto_create_users = config.get("auto_create_users", True)
         self.update_user_info = config.get("update_user_info", True)
@@ -149,6 +155,23 @@ class LDAPAuthProvider(BaseAuthenticationProvider):
         # Initialize server
         self._server = None
         self._initialize_server()
+
+        # T4.1: if the operator opted into an insecure configuration,
+        # make sure every startup announces it so it's visible in log
+        # scrapers and the operator can't forget it's on.
+        if self.allow_insecure:
+            insecure_bits = []
+            if not self.use_ssl and not self.use_tls:
+                insecure_bits.append("plaintext bind on port %d" % self.port)
+            if (self.use_ssl or self.use_tls) and not self.validate_cert:
+                insecure_bits.append("cert validation disabled")
+            logger.warning(
+                "LDAP allow_insecure=true — %s. Credentials may be "
+                "read or intercepted on the network path to %s:%d.",
+                "; ".join(insecure_bits) or "insecure options set",
+                self.host,
+                self.port,
+            )
 
         logger.info(
             f"LDAP authentication provider initialized (server: {self.host}:{self.port})"
@@ -377,6 +400,32 @@ class LDAPAuthProvider(BaseAuthenticationProvider):
         if not self.use_ssl and not self.use_tls and self.port == 636:
             issues.append("Port 636 typically requires SSL")
 
+        # T4.1: refuse plaintext LDAP unless the operator has explicitly
+        # opted in via allow_insecure=true. Prior behaviour let
+        # use_tls=false, use_ssl=false ship silently, sending the
+        # service bind password and every user password in cleartext.
+        if not self.use_ssl and not self.use_tls and not self.allow_insecure:
+            issues.append(
+                "LDAP must use LDAPS (use_ssl=true) or StartTLS "
+                "(use_tls=true) — plaintext bind exposes credentials. "
+                "To knowingly run plaintext LDAP set allow_insecure=true "
+                "in the provider config."
+            )
+
+        # TLS enabled but cert validation disabled is a MITM risk —
+        # validate_cert=false is legal but requires the same explicit
+        # opt-in to keep operators honest.
+        if (
+            (self.use_ssl or self.use_tls)
+            and not self.validate_cert
+            and not self.allow_insecure
+        ):
+            issues.append(
+                "LDAP TLS is enabled but validate_cert=false — this "
+                "disables certificate verification and defeats TLS. "
+                "Set allow_insecure=true to acknowledge the risk."
+            )
+
         return issues
 
     def health_check(self) -> Dict[str, Any]:
@@ -487,6 +536,19 @@ class LDAPAuthProvider(BaseAuthenticationProvider):
             connection = Connection(
                 self._server, auto_bind=False, raise_exceptions=True
             )
+
+        # T4.1: negotiate StartTLS BEFORE the caller invokes .bind().
+        # LDAPS (use_ssl=true) already has TLS from socket dial time —
+        # no upgrade needed. Plaintext (use_tls=false and use_ssl=false)
+        # is only reachable if the operator opted in via
+        # allow_insecure=true; the validator refuses it otherwise.
+        if self.use_tls and not self.use_ssl:
+            if not connection.start_tls():
+                raise ProviderConnectionException(
+                    "LDAP StartTLS upgrade failed. "
+                    f"Server: {self.host}:{self.port}. Refusing to "
+                    "bind credentials over an unencrypted channel."
+                )
 
         return connection
 

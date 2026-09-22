@@ -50,6 +50,12 @@ def make_package(root, plugin_id, tier=None, class_name=None, entry_point=None):
 @pytest.fixture
 def manager():
     pm = PluginManager()
+    # These tests predate V1/V2 signature enforcement and build unsigned
+    # community-tier packages. Flip the opt-in so they exercise the
+    # whitelist/tier gates rather than being short-circuited by the
+    # signature gate. Signature-gate behaviour has its own test file:
+    # tests/unit/test_v1_v2_plugin_signature_verification.py.
+    pm._allow_community_sideload = True
     return pm
 
 
@@ -85,7 +91,16 @@ class TestLoadPackagePlugins:
     def test_tier_within_licence_loads(self, manager, tmp_path):
         make_package(tmp_path, "premium_tracker", tier="pro")
         allow(manager, "premium_tracker")
-        with patch("services.license_service.get_license_service") as mock_ls:
+        # Pro-tier plugins must be signed regardless of the sideload
+        # toggle; this test targets the tier gate, so stub the sig
+        # verifier as verified. V1/V2 has its own coverage of unsigned
+        # pro-tier rejection.
+        with patch(
+            "services.license_service.get_license_service"
+        ) as mock_ls, patch(
+            "services.plugin_package_verifier.verify_package_signature",
+            return_value="verified",
+        ):
             mock_ls.return_value.is_tier_allowed.return_value = True
             manager._load_package_plugins(str(tmp_path))
         assert "premium_tracker" in manager.plugins

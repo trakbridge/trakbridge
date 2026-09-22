@@ -619,6 +619,46 @@ def admin_enable_user(user_id):
     return redirect(url_for("auth.admin_user_detail", user_id=user_id))
 
 
+@bp.route("/admin/users/<int:user_id>/unlock", methods=["POST"])
+@session_only
+@admin_required
+def admin_unlock_user(user_id):
+    """Admin function to clear a lockout on a user account.
+
+    Unlike enable, this does not change the user's status — it only
+    clears failed_login_attempts and locked_until. Intended for
+    locked-but-active accounts (e.g. an operator whose password was
+    fat-fingered too many times).
+    """
+    user = User.query.get_or_404(user_id)
+    current_user = get_current_user()
+
+    if not user.is_locked():
+        flash(f"User {user.username} was not locked", "info")
+        return redirect(url_for("auth.admin_user_detail", user_id=user_id))
+
+    try:
+        user.unlock_account()
+
+        from database import db
+
+        db.session.commit()
+
+        logger.info(
+            f"Admin {current_user.username} unlocked user {user.username}"
+        )
+        flash(f"User {user.username} has been unlocked", "success")
+
+    except Exception as e:
+        from database import db
+
+        db.session.rollback()
+        logger.error(f"Failed to unlock user {user.username}: {e}")
+        flash("Error unlocking user", "error")
+
+    return redirect(url_for("auth.admin_user_detail", user_id=user_id))
+
+
 @bp.route("/admin/users/create", methods=["GET", "POST"])
 @session_only
 @admin_required
