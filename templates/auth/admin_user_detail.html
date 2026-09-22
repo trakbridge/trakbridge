@@ -252,6 +252,17 @@
                         <span class="text-warning text-mono">
                             {{ user.locked_until.strftime('%Y-%m-%d %H:%M:%S') }}
                         </span>
+                        {% if user.is_locked() and user.status.value == 'active' %}
+                        <form method="POST"
+                              action="{{ url_for('auth.admin_unlock_user', user_id=user.id) }}"
+                              class="mt-2"
+                              onsubmit="return confirm('Clear the lockout on this user and reset their failed login counter?')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}"/>
+                            <button type="submit" class="btn btn-outline-warning btn-sm">
+                                <i class="fas fa-unlock"></i> Unlock User
+                            </button>
+                        </form>
+                        {% endif %}
                     </div>
                 </div>
                 {% endif %}

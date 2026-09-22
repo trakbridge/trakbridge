@@ -109,7 +109,7 @@ class SecurityConfig:
     secret_key: str = ""
     session_timeout: int = 3600  # 1 hour
     max_login_attempts: int = 5
-    lockout_duration: int = 900  # 15 minutes
+    lockout_duration_minutes: int = 30
 
     # SSL/TLS settings
     require_ssl: bool = False
@@ -213,7 +213,7 @@ CONFIG_SCHEMAS = {
         "secret_key": {"type": "string", "minLength": 16},
         "session_timeout": {"type": "integer", "minimum": 60, "maximum": 86400},
         "max_login_attempts": {"type": "integer", "minimum": 1, "maximum": 20},
-        "lockout_duration": {"type": "integer", "minimum": 60, "maximum": 3600},
+        "lockout_duration_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
         "require_ssl": {"type": "boolean"},
         "ssl_cert_file": {"type": "string"},
         "ssl_key_file": {"type": "string"},

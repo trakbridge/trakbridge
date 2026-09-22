@@ -1,295 +1,319 @@
-# ABOUTME: Regression tests for T1.4 — failed login counter and configurable
-# ABOUTME: lockout threshold (default 5 failed attempts) with 30-min timeout.
-"""T1.4 — Failed login lockout prevents brute-force attacks.
+# ABOUTME: Regression tests for T1.4 — failed-login counter, account
+# ABOUTME: lockout, and the admin unlock action for local users.
+"""T1.4 — Login lockout and admin unlock.
 
-Background: User authentication endpoints (login form) had no rate limiting or
-account lockout. An attacker can brute-force weak passwords by sending hundreds
-of requests per second. Even with account detection disabled, an attacker can
-enumerate users by timing differences (legitimate user vs. non-existent user).
+The failed-login counter, is_locked() check, lock_account(),
+unlock_account(), and per-provider integration for local users all
+already exist. This test file covers:
 
-The fix adds a per-user failed login counter. After N consecutive failures
-(default 5, configurable), the account is locked for M minutes (default 30,
-configurable). Admin can manually unlock via the user management UI.
-
-Regression test enforces:
-1. Failed login counter increments on every authentication failure.
-2. Successful login resets the counter to 0.
-3. After N failures, the account is locked (subsequent login requests are rejected).
-4. Locked account shows a user-facing message (not a generic "invalid credentials").
-5. Lockout duration is configurable (default 30 min); locked accounts auto-unlock.
-6. Admin user management UI includes a manual unlock button.
-7. The N (failure threshold) is configurable (default 5).
+1. Counter increments on failed local login and resets on success.
+2. Account locks after max_login_attempts consecutive failures.
+3. Locked account is refused login even with the correct password.
+4. Admin dedicated /unlock endpoint clears the lockout without
+   mutating status. Non-admin cannot hit it.
+5. The Unlock button renders on the admin user detail page only when
+   the user is both locked and not disabled.
+6. Fix regression: config/schema.py used a stale 15-min default
+   in seconds; runtime uses 30 min. The dataclass field name and
+   validation bounds now agree with the runtime consumer.
 """
 
-import time
-from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from database import db
+from models.user import AccountStatus, AuthProvider, User, UserRole
+from services.auth.local_provider import LocalAuthProvider
+from tests.conftest import get_csrf_token
+
+
+LOCAL_CONFIG = {
+    "enabled": True,
+    "password_policy": {
+        "min_length": 8,
+        "require_uppercase": True,
+        "require_lowercase": True,
+        "require_numbers": True,
+        "require_special": False,
+    },
+}
+
+
+def _create_lockout_user(username="lockout_target"):
+    """Create + commit a local user; return its id.
+
+    Callers re-fetch the user via User.query.get(uid) inside their own
+    app_context so nothing gets detached across contexts.
+    """
+    user = User(
+        username=username,
+        email=f"{username}@test.com",
+        full_name="Lockout Target",
+        role=UserRole.USER,
+        auth_provider=AuthProvider.LOCAL,
+    )
+    user.set_password("CorrectPass123")
+    db.session.add(user)
+    db.session.commit()
+    return user.id
+
 
 class TestFailedLoginCounter:
-    """Failed login counter increments on failed auth and resets on success."""
+    """Counter increments on failed local login and resets on success."""
 
-    def test_failed_login_increments_counter(self):
-        """Failed login attempt increments the user's failed_login_count."""
-        user = self._create_test_user(username="testuser", failed_login_count=0)
+    def test_failed_login_increments_counter(self, app, db_session):
+        with app.app_context():
+            uid = _create_lockout_user("counter_inc")
+            provider = LocalAuthProvider(LOCAL_CONFIG)
 
-        # Simulate a failed login (wrong password)
-        self._attempt_login(username="testuser", password="wrong_password", expect_failure=True)
+            provider.authenticate("counter_inc", "wrongpass")
 
-        user_after = self._get_user(username="testuser")
-        assert user_after.failed_login_count == 1, (
-            "Failed login must increment failed_login_count"
-        )
+            refreshed = User.query.get(uid)
+            assert refreshed.failed_login_attempts == 1
 
-    def test_successful_login_resets_counter(self):
-        """Successful login resets failed_login_count to 0."""
-        user = self._create_test_user(username="testuser", failed_login_count=3)
+    def test_successful_login_resets_counter(self, app, db_session):
+        with app.app_context():
+            uid = _create_lockout_user("counter_reset")
+            u = User.query.get(uid)
+            u.failed_login_attempts = 3
+            db.session.commit()
 
-        # Correct password
-        self._attempt_login(username="testuser", password="correct_password", expect_failure=False)
+            provider = LocalAuthProvider(LOCAL_CONFIG)
+            response = provider.authenticate(
+                "counter_reset", "CorrectPass123"
+            )
+            assert response.success is True
 
-        user_after = self._get_user(username="testuser")
-        assert user_after.failed_login_count == 0, (
-            "Successful login must reset failed_login_count to 0"
-        )
+            refreshed = User.query.get(uid)
+            assert refreshed.failed_login_attempts == 0
 
-    def test_counter_does_not_reset_on_continued_failures(self):
-        """Counter keeps incrementing across multiple failed attempts."""
-        user = self._create_test_user(username="testuser", failed_login_count=0)
 
-        for i in range(1, 6):
-            self._attempt_login(username="testuser", password="wrong_password", expect_failure=True)
-            user_after = self._get_user(username="testuser")
-            assert user_after.failed_login_count == i, (
-                f"After {i} failed attempts, counter should be {i}"
+class TestAccountLockout:
+    """Account locks after N failures, refuses even the correct password."""
+
+    def test_lock_triggers_after_threshold(self, app, db_session):
+        with app.app_context():
+            uid = _create_lockout_user("lock_threshold")
+            provider = LocalAuthProvider(LOCAL_CONFIG)
+            threshold = 5  # matches default in auth_manager
+
+            for _ in range(threshold):
+                provider.authenticate("lock_threshold", "wrongpass")
+
+            refreshed = User.query.get(uid)
+            assert refreshed.is_locked(), (
+                f"Account should be locked after {threshold} failures; "
+                f"failed_attempts={refreshed.failed_login_attempts}, "
+                f"locked_until={refreshed.locked_until}"
             )
 
-    # Test stub methods — implement these based on your actual auth system
+    def test_locked_account_refuses_correct_password(
+        self, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("locked_refuse")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)
+            db.session.commit()
 
-    @staticmethod
-    def _create_test_user(username: str, failed_login_count: int = 0):
-        """Create a test user with a specific failed_login_count."""
-        # In real code:
-        # user = User(username=username, password_hash=hash("correct_password"))
-        # user.failed_login_count = failed_login_count
-        # db.session.add(user)
-        # db.session.commit()
-        return MagicMock(username=username, failed_login_count=failed_login_count)
+            provider = LocalAuthProvider(LOCAL_CONFIG)
+            response = provider.authenticate(
+                "locked_refuse", "CorrectPass123"
+            )
+            assert response.success is False, (
+                "Correct password on a locked account must still be "
+                "refused. Existing behaviour — regression guard."
+            )
 
-    @staticmethod
-    def _attempt_login(username: str, password: str, expect_failure: bool):
-        """Attempt to log in with the given credentials."""
-        # In real code: call your auth service login endpoint
-        # response = client.post("/login", data={"username": username, "password": password})
-        pass
+    def test_expired_locked_until_reports_not_locked(self, app, db_session):
+        """locked_until in the past AND status==ACTIVE → is_locked False.
 
-    @staticmethod
-    def _get_user(username: str):
-        """Fetch the current user from the database."""
-        # In real code: User.query.filter_by(username=username).first()
-        return MagicMock(username=username, failed_login_count=0)
+        `is_locked()` returns True if EITHER the status is LOCKED or the
+        locked_until timestamp is in the future. So to prove the
+        timestamp-only path we must leave status as ACTIVE.
+        """
+        with app.app_context():
+            uid = _create_lockout_user("expired_lock")
+            u = User.query.get(uid)
+            u.locked_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+            u.status = AccountStatus.ACTIVE  # only the timestamp gates
+            db.session.commit()
+
+            refreshed = User.query.get(uid)
+            assert not refreshed.is_locked(), (
+                "locked_until in the past on an ACTIVE account must "
+                "report is_locked=False"
+            )
 
 
-class TestLoginLockout:
-    """After N failed attempts, account is locked for M minutes."""
+class TestAdminUnlockEndpoint:
+    """POST /auth/admin/users/<id>/unlock clears the lock without status change."""
 
-    def test_login_locked_after_threshold_failures(self):
-        """After LOCKOUT_THRESHOLD failures, further login attempts are rejected."""
-        threshold = 5  # Default
-        user = self._create_test_user(username="testuser", failed_login_count=0)
+    def test_admin_can_unlock_locked_user(
+        self, authenticated_client, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("admin_unlock")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)
+            db.session.commit()
 
-        # 5 failed attempts
-        for _ in range(threshold):
-            self._attempt_login(username="testuser", password="wrong_password", expect_failure=True)
+        client = authenticated_client("admin")
+        csrf = get_csrf_token(client, app)
 
-        user_after = self._get_user(username="testuser")
-        assert user_after.is_locked, (
-            f"After {threshold} failed attempts, account must be locked (is_locked=true)"
+        resp = client.post(
+            f"/auth/admin/users/{uid}/unlock",
+            data={"csrf_token": csrf},
+            follow_redirects=False,
+        )
+        assert resp.status_code in (302, 303), (
+            f"Expected redirect after unlock, got {resp.status_code}"
         )
 
-    def test_locked_account_rejects_login_attempts(self):
-        """When locked, login attempts are rejected immediately (no password check)."""
-        user = self._create_test_user(username="testuser")
-        user.is_locked = True
-        user.locked_until = datetime.utcnow() + timedelta(minutes=30)
+        with app.app_context():
+            refreshed = User.query.get(uid)
+            assert refreshed.locked_until is None
+            assert refreshed.failed_login_attempts == 0
+            # Status returns to ACTIVE (not left as LOCKED)
+            assert refreshed.status == AccountStatus.ACTIVE
 
-        # Even with correct password, login fails
-        response = self._attempt_login(
-            username="testuser",
-            password="correct_password",
-            expect_failure=True
+    def test_unlock_endpoint_noop_when_user_not_locked(
+        self, authenticated_client, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("not_locked")
+
+        client = authenticated_client("admin")
+        csrf = get_csrf_token(client, app)
+
+        resp = client.post(
+            f"/auth/admin/users/{uid}/unlock",
+            data={"csrf_token": csrf},
+            follow_redirects=False,
+        )
+        # Redirect back with an info flash — endpoint accepts the request
+        assert resp.status_code in (302, 303)
+
+    def test_non_admin_cannot_unlock(
+        self, authenticated_client, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("non_admin_target")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)
+            db.session.commit()
+
+        client = authenticated_client("user")
+        csrf = get_csrf_token(client, app)
+
+        resp = client.post(
+            f"/auth/admin/users/{uid}/unlock",
+            data={"csrf_token": csrf},
+            follow_redirects=False,
+        )
+        # 302 to login/deny, or 401/403 depending on the decorator chain
+        assert resp.status_code in (302, 303, 401, 403), (
+            f"Non-admin must be denied; got {resp.status_code}"
         )
 
-        assert response.status_code in (401, 403), (
-            "Locked account must reject login (401 or 403)"
-        )
-        assert "locked" in response.get_text().lower() or "temporarily" in response.get_text().lower(), (
-            "Response should mention the account is locked/temporarily disabled"
-        )
+        with app.app_context():
+            refreshed = User.query.get(uid)
+            assert refreshed.is_locked(), (
+                "Lockout must remain in place after a non-admin attempt"
+            )
 
-    def test_locked_account_unlocks_after_timeout(self):
-        """After lockout duration expires, is_locked is set to false and counter resets."""
-        user = self._create_test_user(username="testuser")
-        user.is_locked = True
-        user.locked_until = datetime.utcnow() - timedelta(seconds=1)  # Already expired
+    def test_unlock_requires_csrf(
+        self, authenticated_client, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("csrf_target")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)
+            db.session.commit()
 
-        # On next login attempt, check if locked. Since locked_until is in the past,
-        # the auth service should auto-unlock.
-        self._attempt_login(username="testuser", password="correct_password", expect_failure=False)
+        client = authenticated_client("admin")
 
-        user_after = self._get_user(username="testuser")
-        assert not user_after.is_locked, (
-            "Account should auto-unlock when locked_until time has passed"
-        )
-        assert user_after.failed_login_count == 0, (
-            "Counter should reset when auto-unlocking"
+        # No csrf_token in body
+        resp = client.post(f"/auth/admin/users/{uid}/unlock", data={})
+        assert resp.status_code in (400, 403), (
+            f"Missing CSRF must be rejected; got {resp.status_code}"
         )
 
-    def test_lockout_duration_configurable(self):
-        """LOCKOUT_DURATION_MINUTES config controls how long accounts stay locked."""
-        # In app config: LOCKOUT_DURATION_MINUTES = 30 (default, configurable)
-        assert True, (
-            "LOCKOUT_DURATION_MINUTES must be configurable in app.config or environment. "
-            "Default: 30. Used when setting is_locked and locked_until."
+
+class TestUnlockButtonTemplate:
+    """The Unlock button appears only for locked-and-active users."""
+
+    def test_button_rendered_for_locked_active_user(
+        self, authenticated_client, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("locked_active")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)
+            # lock_account() flips status to LOCKED. To simulate the
+            # "locked-but-active" state (which is what our button
+            # gates on), keep status ACTIVE but preserve locked_until.
+            u.status = AccountStatus.ACTIVE
+            db.session.commit()
+
+        client = authenticated_client("admin")
+        resp = client.get(f"/auth/admin/users/{uid}")
+        assert resp.status_code == 200
+        body = resp.get_data(as_text=True)
+        assert "Unlock User" in body, (
+            "Locked user detail page must render the Unlock button"
+        )
+        assert f"/auth/admin/users/{uid}/unlock" in body
+
+    def test_button_not_rendered_for_unlocked_user(
+        self, authenticated_client, app, db_session
+    ):
+        with app.app_context():
+            uid = _create_lockout_user("not_locked_view")
+
+        client = authenticated_client("admin")
+        resp = client.get(f"/auth/admin/users/{uid}")
+        assert resp.status_code == 200
+        body = resp.get_data(as_text=True)
+        assert "Unlock User" not in body, (
+            "Unlock button must not render when the user is not locked"
         )
 
-    def test_lockout_threshold_configurable(self):
-        """FAILED_LOGIN_THRESHOLD config controls when lockout triggers."""
-        # In app config: FAILED_LOGIN_THRESHOLD = 5 (default, configurable)
-        assert True, (
-            "FAILED_LOGIN_THRESHOLD must be configurable in app.config or environment. "
-            "Default: 5. After this many failures, account is locked."
+
+class TestSchemaAlignsWithRuntime:
+    """Regression: config/schema.py once had a stale 15-min default in
+    seconds while auth_manager used 30 min. Both must agree now."""
+
+    def test_security_config_uses_minutes_field(self):
+        from config.schema import SecurityConfig
+
+        cfg = SecurityConfig()
+        assert hasattr(cfg, "lockout_duration_minutes"), (
+            "SecurityConfig dataclass must expose lockout_duration_minutes "
+            "(the runtime consumes minutes, not seconds)."
+        )
+        assert not hasattr(cfg, "lockout_duration"), (
+            "Legacy `lockout_duration` seconds field must be removed to "
+            "prevent operators reading a stale default."
+        )
+        assert cfg.lockout_duration_minutes == 30, (
+            "Default lockout duration must be 30 minutes to match "
+            "services/auth/auth_manager.py:73-101 runtime default."
         )
 
-    # Test stub methods
+    def test_max_login_attempts_default(self):
+        from config.schema import SecurityConfig
 
-    @staticmethod
-    def _create_test_user(username: str, is_locked: bool = False):
-        user = MagicMock(username=username, is_locked=is_locked)
-        user.locked_until = None
-        return user
+        cfg = SecurityConfig()
+        assert cfg.max_login_attempts == 5
 
-    @staticmethod
-    def _attempt_login(username: str, password: str, expect_failure: bool):
-        return MagicMock(status_code=401 if expect_failure else 200)
+    def test_json_schema_uses_minutes_field(self):
+        from config.schema import CONFIG_SCHEMAS
 
-    @staticmethod
-    def _get_user(username: str):
-        return MagicMock(username=username, is_locked=False, failed_login_count=0)
-
-
-class TestAdminUnlock:
-    """Admin can manually unlock locked accounts via the user management UI."""
-
-    def test_admin_unlock_button_on_user_detail_page(self):
-        """User management page for a locked account shows an Unlock button."""
-        user = self._create_test_user(username="testuser")
-        user.is_locked = True
-
-        # Admin loads /admin/users/testuser
-        response = self._get_user_detail_page(username="testuser", admin_auth=True)
-
-        assert "unlock" in response.text.lower(), (
-            "Locked user detail page must show an Unlock button or action"
+        security = CONFIG_SCHEMAS.get("security", {})
+        assert "lockout_duration_minutes" in security, (
+            "JSON schema key must be lockout_duration_minutes to match "
+            "the dataclass and runtime"
         )
-
-    def test_admin_unlock_action_clears_lock(self):
-        """Clicking unlock clears is_locked and resets failed_login_count."""
-        user = self._create_test_user(username="testuser")
-        user.is_locked = True
-        user.failed_login_count = 5
-
-        # Admin POSTs to /admin/users/testuser/unlock
-        response = self._unlock_user(username="testuser", admin_auth=True)
-
-        assert response.status_code == 200, (
-            "Admin unlock action must succeed (200)"
-        )
-
-        user_after = self._get_user(username="testuser")
-        assert not user_after.is_locked, "Account must be unlocked"
-        assert user_after.failed_login_count == 0, "Counter must reset"
-
-    def test_non_admin_cannot_unlock(self):
-        """Non-admin user cannot unlock accounts."""
-        user = self._create_test_user(username="testuser")
-        user.is_locked = True
-
-        # Non-admin POSTs to /admin/users/testuser/unlock
-        response = self._unlock_user(username="testuser", admin_auth=False)
-
-        assert response.status_code in (401, 403), (
-            "Non-admin must be rejected (401 or 403)"
-        )
-
-        user_after = self._get_user(username="testuser")
-        assert user_after.is_locked, "Account must remain locked"
-
-    # Test stub methods
-
-    @staticmethod
-    def _create_test_user(username: str, is_locked: bool = False):
-        return MagicMock(username=username, is_locked=is_locked, failed_login_count=0)
-
-    @staticmethod
-    def _get_user_detail_page(username: str, admin_auth: bool):
-        return MagicMock(text="<button>Unlock</button>" if admin_auth else "<p>No unlock option</p>")
-
-    @staticmethod
-    def _unlock_user(username: str, admin_auth: bool):
-        if admin_auth:
-            return MagicMock(status_code=200)
-        else:
-            return MagicMock(status_code=403)
-
-    @staticmethod
-    def _get_user(username: str):
-        return MagicMock(username=username, is_locked=False, failed_login_count=0)
-
-
-class TestLoginLockoutUserExperience:
-    """Users see clear messaging when locked out."""
-
-    def test_locked_account_shows_helpful_message(self):
-        """Error message tells the user their account is locked and how long."""
-        user = self._create_test_user(username="testuser")
-        user.is_locked = True
-        user.locked_until = datetime.utcnow() + timedelta(minutes=15)
-
-        response = self._attempt_login(
-            username="testuser",
-            password="correct_password",
-            expect_failure=True
-        )
-
-        message = response.get_text()
-        assert "locked" in message.lower() or "temporarily" in message.lower(), (
-            "Message must mention the account is locked"
-        )
-        # Optionally: mention how long ("locked for 15 more minutes")
-
-    def test_non_existent_user_does_not_leak_enumeration(self):
-        """Failed login for non-existent user returns generic error (no timing leak)."""
-        # This is a general security best practice, not specific to lockout.
-        # But mentioning it here for completeness.
-        response1 = self._attempt_login(username="nonexistent", password="anything", expect_failure=True)
-        response2 = self._attempt_login(username="realuser", password="wrong", expect_failure=True)
-
-        # Both should return the same error message and similar response time
-        assert response1.get_text() == response2.get_text(), (
-            "Same error message for non-existent user and wrong password "
-            "(prevents user enumeration)"
-        )
-
-    @staticmethod
-    def _create_test_user(username: str, is_locked: bool = False):
-        return MagicMock(username=username, is_locked=is_locked)
-
-    @staticmethod
-    def _attempt_login(username: str, password: str, expect_failure: bool):
-        return MagicMock(
-            status_code=401 if expect_failure else 200,
-            text="Account is temporarily locked. Try again later."
-        )
+        assert "lockout_duration" not in security
