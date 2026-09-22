@@ -1,5 +1,110 @@
 # TrakBridge Release Notes
 
+## Version 2.2.1 - Threat-Model Follow-Up & Sideload Signature Enforcement
+
+**Release Date:** September 22, 2026
+**Focus: Closing the remaining 2.2.0-triage security items — LDAP secure-by-default, inbound anonymous-injection gate, plugin sideload signature enforcement, admin unlock action, UDP source filter validation, and an image-scan vulnerability sweep**
+
+TrakBridge 2.2.1 is a security patch release that closes every item deferred from 2.2.0's threat-model triage. Nothing in this release changes user-visible workflows; the surface area is defensive. If 2.2.0 was "close the big attack paths and land the SDK", 2.2.1 is "no more silent no-ops in the auth stack, and every code-loading path enforces its signature check".
+
+This is a straight upgrade from 2.2.0 — no schema migration, no new required secrets. Two configuration behaviours change in ways that could affect running deployments: LDAP configs that were relying on `use_tls: true` actually working (it wasn't) will now fail if the directory server doesn't accept StartTLS, and unsigned files in `external_plugins/` will be refused at startup unless an operator opts in. Both are covered under Upgrade Notes.
+
+---
+
+### LDAP SECURE-BY-DEFAULT
+
+#### `use_tls: true` finally does something
+**T4.1 — StartTLS is negotiated before every bind on port 389**
+
+The 2.1.x threat model called this out; the fix landed in 2.2.1. The prior LDAP provider constructed `Connection(..., auto_bind=False)` and never issued `start_tls()`. That meant `use_tls: true` in the config was a silent no-op — the connection dialled port 389 in cleartext and sent every user password and the service bind password over the wire. `validate_cert: true` provided false assurance because no TLS handshake ever occurred to validate against.
+
+`_get_connection()` now calls `connection.start_tls()` between construction and the caller's `.bind()` whenever `use_tls=true` and `use_ssl=false`. LDAPS (`use_ssl=true`) still gets TLS at socket dial time via the Server config; no upgrade needed. If `start_tls()` fails the connection factory raises before any bind is attempted — no cleartext fallback under any circumstance. Anonymous, service-account, and user-credential connection paths all go through the same factory, so all three are covered.
+
+The config validator gained two new refusals. Plaintext LDAP (`use_ssl: false` and `use_tls: false`) is now rejected unless the operator sets `allow_insecure: true`. TLS enabled with `validate_cert: false` gets the same treatment. When `allow_insecure` is honoured, every startup emits a WARNING per-connection naming the server, port, and the specific insecure option — so the choice appears in every log scrape and cannot be forgotten. This is the pattern from 2.2.0's `PROXY_TRUSTED` and `SESSION_COOKIE_SECURE` overrides: insecurity is possible but never accidental.
+
+---
+
+### INBOUND ANONYMOUS-INJECTION GATE
+
+#### `auth_mode: none` on generic inbound plugins requires an ip_allowlist
+**T1.3 — no more world-accessible CoT injection endpoints by default**
+
+The generic JSON and XML inbound plugins accept `auth_mode: none` for testing convenience. Left in place in production it leaves `POST /api/inbound/<id>/data` world-accessible — anyone who can reach the endpoint can inject arbitrary CoT into every TAK server on the stream.
+
+`validate_config()` on both plugins now raises with a user-readable message when `auth_mode=none` is chosen without an `ip_allowlist`. `0.0.0.0/0` is accepted as an explicit wildcard, so operators who genuinely need an open endpoint can preserve that behaviour — but it's now an auditable config entry rather than an implicit default. Every other value must parse as an IP address or CIDR block.
+
+The runtime side had a working `_check_ip_allowlist()` already; it's been widened to accept both the legacy JSON-array format (backward compatible for existing streams) and the new comma/newline-separated text the UI now exposes. Malformed values fail closed — no accidental deny-to-allow conversion during upgrade. Save-time validation is wired into `update_stream_safely()` so the error surfaces in the UI immediately, not just when the listener next starts.
+
+---
+
+### PLUGIN SIDELOAD SIGNATURE ENFORCEMENT
+
+#### `external_plugins/` no longer trusts every file it finds
+**V1/V2 — signature check on package and loose-`.py` sideload paths**
+
+The ZIP install path added in 2.2.0 already verified plugin signatures via `services/plugin_package_verifier.verify_package_signature()`. The sideload path — files dropped into `external_plugins/` at build time or via a volume mount — did not. An attacker with filesystem write got RCE at the next restart.
+
+`plugins/plugin_manager._load_package_plugins()` now gates on the existing package verifier before importing any code. A new sibling `verify_single_file_signature()` handles loose `.py + .py.sig` pairs using the same Ed25519 trust root and result contract. Refusal semantics respect both tier and a new operator opt-in:
+
+- **Signed** — always load
+- **Unsigned community-tier** — refused unless `plugin_settings.allow_community_sideload: true` is set in `config/settings/plugins.yaml`; when the toggle is on, load with a WARNING naming the file so the trust decision appears in every boot log
+- **Unsigned pro/enterprise** — refused regardless of the toggle. Loose `.py` files carry no tier declaration and are treated as community for toggle purposes; pro/enterprise plugins must ship as full signed packages
+
+The toggle is deliberately a config-file setting for 2.2.1. Promoting it to a live admin-UI toggle is queued for the 2.3.0 config-into-UI migration and needs a new `SystemSetting` model that isn't worth landing in a security patch. Where signatures come from is documented in the new **Plugin Signing** section of `docs/PLUGIN_SECURITY.md`: TrakBridge Project's offline signing key, with the signing tooling itself living in `trakbridge-plugins-premium`.
+
+---
+
+### ADMIN UNLOCK ACTION
+
+#### Dedicated unlock without status side-effects
+**T1.4 — Unlock button on the admin user detail page**
+
+The failed-login counter, `is_locked()` check, `lock_account()`, and `unlock_account()` all existed and integrated correctly with the local auth path. Two gaps remained.
+
+`config/schema.py` declared `lockout_duration: int = 900` (15 minutes in seconds) while the runtime at `services/auth/auth_manager.py:73-101` reads `lockout_duration_minutes` with a 30-minute default. The dataclass field was documentation-only but misleading — an operator reading the schema for expected behaviour got the wrong unit and the wrong number. Renamed to `lockout_duration_minutes: int = 30` with validator bounds of 1-1440 minutes so both artefacts agree with the runtime.
+
+The admin user detail page displayed `failed_login_attempts` and `locked_until` but offered no dedicated action to clear a lock. An admin who wanted to unlock a locked user had to click Enable — which also mutates status. That was an accidental side-effect nobody should have to memorise. Added `POST /auth/admin/users/<id>/unlock` mirroring the existing disable/enable pattern; the Unlock button on the detail page renders only when the user is both locked and still ACTIVE, is CSRF-protected, and its handler is idempotent (info flash if the account isn't currently locked).
+
+---
+
+### UDP MULTICAST SOURCE FILTER VALIDATION
+
+#### Invalid source filter entries caught at config save, not listener startup
+**T1.2 — kernel-level SSM was already wired; validation is the new bit**
+
+The IGMPv3 source-specific multicast join (`IP_ADD_SOURCE_MEMBERSHIP`) was already in place. When configured, the kernel drops datagrams from any source not in the filter list before they reach userspace — that's the actual security guarantee, and it prevented spoofed CoT injection from other hosts on the same multicast group.
+
+What was missing: the `source_filter` field wasn't validated at save time. Bad entries (typo, CIDR, hostname) crashed the join with an obscure `inet_aton` error only when the listener started. `validate_config()` now rejects invalid `source_filter` entries and non-multicast `multicast_group` addresses at save time, so operators see the mistake immediately in the UI. The field's help text also gained explicit documentation of the kernel-drop guarantee.
+
+---
+
+### DEPENDENCY VULNERABILITY SWEEP
+
+#### Trivy scan cleared — pip / setuptools / msgpack floors added
+**9 CVEs closed, none of them exploitable against TrakBridge as shipped**
+
+A Trivy scan of the runtime image flagged nine CVEs across three packages that didn't appear in `requirements.txt` or `pyproject.toml`. `msgpack@1.1.2` (GHSA-6v7p-g79w-8964, HIGH) came in transitively via `aiocache`. `pip@25.0.1` and `setuptools@70.3.0` were the versions the `python:3.12-slim` base image shipped — `Dockerfile:28` ran `pip install --upgrade …` but "upgrade" is build-time-only and the layer Trivy scanned was produced before newer versions landed on PyPI.
+
+None of the CVEs is a direct runtime attack vector against TrakBridge — pip/setuptools findings require attacker-controlled package indexes or sdists at install time, and the msgpack DoS needs untrusted bytes into a shared Unpacker (TrakBridge doesn't expose one). But leaving HIGH-severity findings in the scan output blocks release promotion through downstream compliance gates, so we pin.
+
+`Dockerfile:28` now carries explicit floors for `pip>=26.2.0` and `setuptools>=83.0.0`. `pyproject.toml` and `requirements.txt` add `msgpack>=1.2.1` (declared explicitly even though transitive, so the resolver can't pick a vulnerable version) and tighten `setuptools>=83.0.0`. The `[build-system].requires` block also lifted to `setuptools>=83.0.0` so the PEP-517 bootstrap resolver picks the safe version at build time.
+
+Floors are not equality pins — the resolver stays free to pick newer versions, but nothing below the fixed threshold can resolve. Rebuild the image and re-run Trivy to pick up the fix; existing running containers keep their old versions.
+
+CVEs closed: GHSA-6v7p-g79w-8964, GHSA-4xh5-x5gv-qwph, GHSA-qwm4-qh6w-59xr, GHSA-58qw-9mgm-455v, GHSA-jp4c-xjxw-mgf9, GHSA-wf93-45jw-7689, GHSA-6vgw-5pg2-w6jp, CVE-2025-47273, CVE-2026-59890.
+
+---
+
+### UPGRADE NOTES
+
+- **Straight upgrade from 2.2.0.** No schema migration, no new required secrets, no configuration change required for a healthy deployment
+- **LDAP deployments where the directory server does not support StartTLS on port 389 will start failing binds.** Prior behaviour silently sent credentials in cleartext despite `use_tls: true` — the fix means credentials now actually get TLS, but the server has to accept the upgrade. Either configure the LDAP server to accept StartTLS on 389, switch to LDAPS on 636, or (as an audited last resort) set `allow_insecure: true` in the provider config to preserve the old cleartext behaviour with a boot-time WARNING
+- **Existing streams with `auth_mode=none` and no `ip_allowlist` will fail validation on next save.** The already-running listener keeps operating with its stored (pre-2.2.1) config until the next process restart; on restart the invalid config is refused with the same error. Set an explicit `ip_allowlist` (use `0.0.0.0/0` to preserve the old world-accessible behaviour with an audit trail)
+- **Loose `.py` files in `external_plugins/` will be skipped at startup unless signed or the operator opts in.** Signed packages continue to load unchanged. Set `plugin_settings.allow_community_sideload: true` in `config/settings/plugins.yaml` to preserve the pre-2.2.1 behaviour for community-tier plugins; pro/enterprise unsigned sideloads remain refused regardless of the toggle
+- **Container image rebuild required to pick up the new pip / setuptools / msgpack floors.** Existing running containers keep their old versions; the fix applies at rebuild
+
+---
+
 ## Version 2.2.0 - API Keys, Self-Healing Connections & Security Hardening
 
 **Release Date:** September 6, 2026
