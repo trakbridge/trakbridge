@@ -34,6 +34,8 @@ Mako
 marshmallow
 mgrs
 MarkupSafe
+# msgpack floor closes GHSA-6v7p-g79w-8964 (transitive via aiocache).
+msgpack>=1.2.1
 multidict
 paho-mqtt
 propcache
@@ -49,7 +51,8 @@ python-dateutil
 python-dotenv
 PyYAML
 requests
-setuptools
+# setuptools floor closes CVE-2025-47273 and CVE-2026-59890.
+setuptools>=83.0.0
 setuptools-scm
 six
 SQLAlchemy

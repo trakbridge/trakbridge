@@ -24,8 +24,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Upgrade pip and install build tools
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel setuptools-scm
+# Upgrade pip and install build tools. Floors are explicit to close
+# Trivy findings on the base-image pip/setuptools: GHSA-4xh5-x5gv-qwph,
+# GHSA-qwm4-qh6w-59xr, GHSA-58qw-9mgm-455v, GHSA-jp4c-xjxw-mgf9,
+# GHSA-wf93-45jw-7689, GHSA-6vgw-5pg2-w6jp (pip); CVE-2025-47273,
+# CVE-2026-59890 (setuptools). Any version at or above these floors
+# is accepted; the resolver may pick something newer at build time.
+RUN pip install --no-cache-dir --upgrade \
+    'pip>=26.2.0' \
+    'setuptools>=83.0.0' \
+    'wheel' \
+    'setuptools-scm'
 
 # Copy all files
 COPY . /app
