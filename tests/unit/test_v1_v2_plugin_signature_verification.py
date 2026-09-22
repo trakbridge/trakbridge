@@ -1,362 +1,342 @@
-# ABOUTME: Regression tests for V1/V2 — plugin files (loaded from ZIP or local)
-# ABOUTME: must be cryptographically signed and verified before execution.
-"""V1 / V2 — Plugin signature verification prevents supply-chain compromise.
+# ABOUTME: Regression tests for V1/V2 — signature enforcement on
+# ABOUTME: sideloaded plugins (packages + loose .py) plus CLI smoke.
+"""Plugin signature verification on sideload.
 
-Background: The application supports loading third-party plugins via:
-1. Sideloading: .py files placed in the plugins/ directory at startup (V1)
-2. ZIP upload: .zip files uploaded via the web UI (V2)
+The threat model calls out that files placed in external_plugins/ load
+at startup with no cryptographic check. An attacker with filesystem
+write gets RCE at next restart.
 
-An attacker who gains write access to the filesystem or MITM the ZIP upload can
-inject arbitrary Python code into a plugin, gaining RCE with the application's
-privileges. Even without filesystem access, an attacker can compromise a plugin
-maintainer's PyPI account or GitHub releases.
+Fix wired here:
 
-The fix enforces that all plugins must be cryptographically signed. The application
-maintains a trust store of authorized plugin developers' public keys. At load time:
-- For sideloaded plugins: verify the .py file has a valid .sig signature file
-- For ZIP uploads: verify the __SIGNATURE__ manifest file inside the ZIP
+- `verify_package_signature()` (already shipping) is now invoked in
+  `PluginManager._load_package_plugins()` before the package is imported.
+- New `verify_single_file_signature()` in the same module handles loose
+  `.py` sideloads.
+- Both paths honour a new `plugin_settings.allow_community_sideload`
+  key in `config/settings/plugins.yaml`. When true, unsigned
+  community-tier files load with a WARNING. Default false → refused.
+- Pro/enterprise plugins are never permitted unsigned, regardless of
+  the toggle.
 
-Unsigned or invalid-signature plugins are rejected at load time with a clear error.
-
-Regression test enforces:
-1. Unsigned plugins are rejected at load time.
-2. Plugins with invalid signatures (corrupted or wrong key) are rejected.
-3. Plugins signed by trusted keys are loaded successfully.
-4. The trust store is immutable (cannot be modified without code changes).
-5. Plugin upload UI requires a valid signature before accepting the ZIP.
-6. Sideloaded plugins without signatures are rejected at startup.
+The ZIP install path (`services/plugin_admin_service.install_plugin`)
+is unchanged — its existing tests in
+`tests/unit/test_plugin_admin_service_install.py` continue to guard it.
 """
 
+import base64
 import hashlib
-import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from plugins.plugin_manager import PluginManager
+from services.plugin_package_verifier import (
+    canonical_package_digest,
+    verify_package_signature,
+    verify_single_file_signature,
+)
+from tests.fixtures.plugin_package_builder import build_package_dir
 
 
-class TestPluginSignatureVerification:
-    """Plugins must have valid signatures to be loaded."""
-
-    def test_unsigned_plugin_rejected_at_load(self):
-        """Attempting to load an unsigned .py plugin is rejected."""
-        plugin_path = Path("plugins/custom_plugin.py")
-        # No .sig file exists for this plugin
-
-        with pytest.raises(RuntimeError) as exc_info:
-            self._load_plugin(plugin_path)
-
-        assert "signature" in str(exc_info.value).lower(), (
-            "Error message must mention signature verification"
+@pytest.fixture
+def signing_keypair(monkeypatch):
+    """Generate an Ed25519 key; swap its public half in as the trust root."""
+    key = Ed25519PrivateKey.generate()
+    public_b64 = base64.b64encode(
+        key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
         )
-
-    def test_invalid_signature_rejected_at_load(self):
-        """Plugin with invalid/corrupted signature is rejected."""
-        plugin_path = Path("plugins/custom_plugin.py")
-        sig_path = Path("plugins/custom_plugin.py.sig")
-
-        # Create invalid signature file (random bytes)
-        sig_path.write_bytes(b"corrupted_signature_data")
-
-        with pytest.raises(RuntimeError) as exc_info:
-            self._load_plugin(plugin_path)
-
-        assert "signature" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower(), (
-            "Error message must mention signature verification failure"
-        )
-
-        # Cleanup
-        sig_path.unlink()
-
-    def test_wrong_key_signature_rejected(self):
-        """Plugin signed by untrusted key is rejected."""
-        plugin_path = Path("plugins/custom_plugin.py")
-        sig_path = Path("plugins/custom_plugin.py.sig")
-
-        # Create a signature using an untrusted key (not in the trust store)
-        plugin_content = b"def transform_payload(raw_body, content_type, headers): return []"
-        plugin_path.write_bytes(plugin_content)
-
-        # Sign with an untrusted private key
-        untrusted_sig = self._sign_plugin(plugin_content, key_path="untrusted_key.pem")
-        sig_path.write_bytes(untrusted_sig)
-
-        with pytest.raises(RuntimeError) as exc_info:
-            self._load_plugin(plugin_path)
-
-        assert "trusted" in str(exc_info.value).lower() or "authorized" in str(exc_info.value).lower(), (
-            "Error message must mention that the key is not trusted"
-        )
-
-        # Cleanup
-        plugin_path.unlink()
-        sig_path.unlink()
-
-    def test_trusted_key_signature_accepted(self):
-        """Plugin signed by a trusted key in the trust store is loaded."""
-        plugin_path = Path("plugins/custom_plugin.py")
-        sig_path = Path("plugins/custom_plugin.py.sig")
-
-        plugin_content = b"def transform_payload(raw_body, content_type, headers): return []"
-        plugin_path.write_bytes(plugin_content)
-
-        # Sign with a trusted key (from the trust store)
-        trusted_sig = self._sign_plugin(plugin_content, key_path="trusted_key.pem")
-        sig_path.write_bytes(trusted_sig)
-
-        # Should load without error
-        try:
-            self._load_plugin(plugin_path)
-        except RuntimeError as e:
-            pytest.fail(f"Trusted-signed plugin should load: {e}")
-
-        # Cleanup
-        plugin_path.unlink()
-        sig_path.unlink()
-
-    # Stub methods
-
-    @staticmethod
-    def _load_plugin(plugin_path: Path):
-        """Load and verify a plugin's signature."""
-        # In real code:
-        # sig_path = plugin_path.with_suffix(plugin_path.suffix + ".sig")
-        # if not sig_path.exists():
-        #     raise RuntimeError(f"Missing signature file: {sig_path}")
-        # plugin_data = plugin_path.read_bytes()
-        # signature = sig_path.read_bytes()
-        # verify_signature(plugin_data, signature, trusted_keys=PLUGIN_TRUST_STORE)
-        # importlib.import_module(...)
-        pass
-
-    @staticmethod
-    def _sign_plugin(content: bytes, key_path: str) -> bytes:
-        """Sign plugin content with a private key."""
-        # In real code: use cryptography.hazmat to sign
-        # with open(key_path, 'rb') as f:
-        #     private_key = serialization.load_pem_private_key(f.read(), password=None)
-        # signature = private_key.sign(content, padding.PKCS1v15(), hashes.SHA256())
-        return b"mock_signature"
-
-
-class TestZIPPluginSignatureVerification:
-    """ZIP-uploaded plugins must contain a valid __SIGNATURE__ manifest."""
-
-    def test_unsigned_zip_rejected_on_upload(self):
-        """ZIP file without __SIGNATURE__ is rejected at upload."""
-        zip_path = Path("test_plugin.zip")
-
-        # Create a ZIP with only the plugin file, no __SIGNATURE__
-        self._create_test_zip(
-            zip_path,
-            files={"plugin.py": b"def transform_payload(...): pass"},
-            include_signature=False
-        )
-
-        with pytest.raises(ValueError) as exc_info:
-            self._upload_and_verify_plugin_zip(zip_path)
-
-        assert "signature" in str(exc_info.value).lower(), (
-            "Error must mention missing signature"
-        )
-
-        zip_path.unlink()
-
-    def test_invalid_zip_signature_rejected(self):
-        """ZIP with invalid __SIGNATURE__ manifest is rejected."""
-        zip_path = Path("test_plugin.zip")
-
-        # Create a ZIP with corrupted __SIGNATURE__
-        self._create_test_zip(
-            zip_path,
-            files={"plugin.py": b"def transform_payload(...): pass"},
-            include_signature=True,
-            signature_content=b"corrupted_signature"
-        )
-
-        with pytest.raises(ValueError) as exc_info:
-            self._upload_and_verify_plugin_zip(zip_path)
-
-        assert "signature" in str(exc_info.value).lower() or "invalid" in str(exc_info.value).lower(), (
-            "Error must mention signature verification failure"
-        )
-
-        zip_path.unlink()
-
-    def test_trusted_zip_signature_accepted(self):
-        """ZIP with valid signature from trusted key is accepted."""
-        zip_path = Path("test_plugin.zip")
-
-        # Create a properly signed ZIP
-        self._create_test_zip(
-            zip_path,
-            files={"plugin.py": b"def transform_payload(...): pass"},
-            include_signature=True,
-            signature_content=self._sign_plugin(b"plugin_manifest", key_path="trusted_key.pem")
-        )
-
-        try:
-            self._upload_and_verify_plugin_zip(zip_path)
-        except ValueError as e:
-            pytest.fail(f"Trusted-signed ZIP should be accepted: {e}")
-
-        zip_path.unlink()
-
-    # Stub methods
-
-    @staticmethod
-    def _create_test_zip(zip_path: Path, files: dict, include_signature: bool = False, signature_content: bytes = b""):
-        """Create a test ZIP file."""
-        import zipfile
-        with zipfile.ZipFile(zip_path, 'w') as zf:
-            for filename, content in files.items():
-                zf.writestr(filename, content)
-            if include_signature:
-                zf.writestr("__SIGNATURE__", signature_content)
-
-    @staticmethod
-    def _upload_and_verify_plugin_zip(zip_path: Path):
-        """Simulate uploading a ZIP plugin."""
-        # In real code: POST to /api/plugins/upload with zip_path as file
-        # The endpoint should extract the ZIP, verify __SIGNATURE__, and store the plugin
-        pass
-
-    @staticmethod
-    def _sign_plugin(content: bytes, key_path: str) -> bytes:
-        """Sign content with a private key."""
-        return b"mock_signature"
-
-
-class TestPluginTrustStore:
-    """Plugin trust store (authorized developer keys) is immutable."""
-
-    def test_plugin_trust_store_exists(self):
-        """Application maintains a PLUGIN_TRUST_STORE of authorized public keys."""
-        # In real code: load from init/plugin-signing-keys/ directory or similar
-        trust_store_path = Path("init/plugin-signing-keys/")
-        assert trust_store_path.exists(), (
-            "Plugin trust store directory must exist at init/plugin-signing-keys/"
-        )
-
-    def test_trust_store_contains_public_keys(self):
-        """Trust store directory contains PEM-formatted public keys."""
-        trust_store_path = Path("init/plugin-signing-keys/")
-        public_keys = list(trust_store_path.glob("*.pub"))
-
-        assert len(public_keys) > 0, (
-            "Plugin trust store must contain at least one public key (.pub file)"
-        )
-
-    def test_trust_store_is_read_only_at_runtime(self):
-        """Trust store cannot be modified by the application at runtime."""
-        # In real code: the trust store is loaded at startup into a frozen data structure
-        # Attempting to add/remove keys at runtime raises an error
-        assert True, (
-            "Plugin trust store must be immutable after startup. "
-            "Load keys from init/plugin-signing-keys/ at app startup into a frozenset."
-        )
-
-    def test_adding_untrusted_key_requires_code_change(self):
-        """To authorize a new plugin developer, the key must be added to git and deployed."""
-        # This is a documentation test: adding a new trusted key requires:
-        # 1. Obtain the developer's public key
-        # 2. Place it in init/plugin-signing-keys/developer_name.pub
-        # 3. Commit and deploy the code
-        assert True, (
-            "Plugin developer keys are managed via git commits to "
-            "init/plugin-signing-keys/, not runtime configuration. "
-            "This ensures trust store changes are auditable and reversible."
-        )
-
-
-class TestPluginLoadTimeEnforcement:
-    """Signature verification happens at load time, blocking execution of untrusted code."""
-
-    def test_sideloaded_plugins_verified_at_startup(self):
-        """At app startup, sideloaded plugins are verified before import."""
-        # Create an unsigned plugin in plugins/
-        plugin_path = Path("plugins/unsigned_plugin.py")
-        plugin_path.write_bytes(b"def transform_payload(...): pass")
-
-        # Simulate app startup
-        with pytest.raises(RuntimeError) as exc_info:
-            self._simulate_app_startup()
-
-        assert "unsigned_plugin" in str(exc_info.value) or "signature" in str(exc_info.value).lower(), (
-            "Startup must fail and report which plugin failed verification"
-        )
-
-        # Cleanup
-        plugin_path.unlink()
-
-    def test_zip_uploaded_plugins_verified_on_upload(self):
-        """ZIP plugins are verified before being extracted and executed."""
-        zip_path = Path("malicious_plugin.zip")
-
-        # Create an unsigned ZIP
-        import zipfile
-        with zipfile.ZipFile(zip_path, 'w') as zf:
-            zf.writestr("plugin.py", b"import os; os.system('rm -rf /')")
-
-        # Attempt to upload
-        with pytest.raises(ValueError) as exc_info:
-            self._upload_plugin_zip(zip_path)
-
-        assert "signature" in str(exc_info.value).lower(), (
-            "Upload must fail and mention signature verification"
-        )
-
-        # Ensure the malicious code was never executed
-        # (If we got here without a syscall to os.system, we're safe)
-
-        zip_path.unlink()
-
-    # Stub methods
-
-    @staticmethod
-    def _simulate_app_startup():
-        """Simulate application startup and plugin discovery."""
-        # In real code: app.init_app() loads plugins from plugins/ directory
-        pass
-
-    @staticmethod
-    def _upload_plugin_zip(zip_path: Path):
-        """Simulate uploading a plugin ZIP via the web UI."""
-        # In real code: POST /api/plugins/upload with multipart form data
-        pass
-
-
-class TestPluginSigningDocumentation:
-    """Documentation must explain how to sign plugins for distribution."""
-
-    def test_plugin_signing_guide_exists(self):
-        """A guide for plugin developers on how to sign their plugins exists."""
-        guide_paths = [
-            Path("docs/PLUGIN_SIGNING.md"),
-            Path("docs/plugin-development.md"),
-            Path("README.md"),
-        ]
-
-        found = any(p.exists() for p in guide_paths)
-        assert found, (
-            "Documentation on plugin signing must exist. Create docs/PLUGIN_SIGNING.md "
-            "explaining how developers sign plugins before distribution."
-        )
-
-    def test_signing_guide_includes_key_generation(self):
-        """Signing guide explains how to generate a key pair."""
-        guide_path = Path("docs/PLUGIN_SIGNING.md")
-        if guide_path.exists():
-            content = guide_path.read_text()
-            assert "private" in content.lower() and "public" in content.lower(), (
-                "Guide must explain key pair generation"
+    ).decode("ascii")
+    monkeypatch.setattr(
+        "services.license_service.EMBEDDED_LICENSE_PUBLIC_KEY", public_b64
+    )
+    return key
+
+
+def _sign_loose_py(py_path: Path, key: Ed25519PrivateKey) -> Path:
+    """Write `<py_path>.sig` matching `scripts/sign_plugin.py --file`."""
+    digest = hashlib.sha256(py_path.read_bytes()).digest()
+    signature = key.sign(digest)
+    sig_path = py_path.with_suffix(py_path.suffix + ".sig")
+    sig_path.write_text(base64.b64encode(signature).decode("ascii") + "\n")
+    return sig_path
+
+
+def _write_loose_plugin(dir_: Path, name: str) -> Path:
+    """Drop a minimal loose .py plugin file and return its path."""
+    py = dir_ / f"{name}.py"
+    py.write_text(
+        "from plugins.base_plugin import BaseGPSPlugin\n\n"
+        f"class {name.title().replace('_', '')}Plugin(BaseGPSPlugin):\n"
+        "    @property\n"
+        "    def plugin_name(self):\n"
+        f"        return '{name}'\n\n"
+        "    @property\n"
+        "    def plugin_metadata(self):\n"
+        "        return {'display_name': 'x', 'category': 'tracker', "
+        "'config_fields': []}\n\n"
+        "    async def fetch_locations(self, session):\n"
+        "        return []\n"
+    )
+    return py
+
+
+# =========================================================================
+# verify_single_file_signature — new helper
+# =========================================================================
+
+
+class TestVerifySingleFileSignature:
+    """The .py + .py.sig helper mirrors verify_package_signature's contract."""
+
+    def test_unsigned_returns_unsigned(self, tmp_path, signing_keypair):
+        py = _write_loose_plugin(tmp_path, "no_sig_plugin")
+        assert verify_single_file_signature(py) == "unsigned"
+
+    def test_valid_signature_returns_verified(self, tmp_path, signing_keypair):
+        py = _write_loose_plugin(tmp_path, "signed_plugin")
+        _sign_loose_py(py, signing_keypair)
+        assert verify_single_file_signature(py) == "verified"
+
+    def test_tampered_file_returns_invalid(self, tmp_path, signing_keypair):
+        py = _write_loose_plugin(tmp_path, "tampered_plugin")
+        _sign_loose_py(py, signing_keypair)
+        py.write_text(py.read_text() + "\n# tampered content\n")
+        assert verify_single_file_signature(py) == "invalid"
+
+    def test_wrong_key_returns_invalid(self, tmp_path, signing_keypair):
+        py = _write_loose_plugin(tmp_path, "wrong_key_plugin")
+        other_key = Ed25519PrivateKey.generate()
+        _sign_loose_py(py, other_key)
+        assert verify_single_file_signature(py) == "invalid"
+
+
+# =========================================================================
+# PluginManager — package sideload enforcement
+# =========================================================================
+
+
+class TestPackageSideloadGate:
+    """_load_package_plugins() consults sig + tier + toggle before loading."""
+
+    def _fresh_manager(self, allow_sideload: bool) -> PluginManager:
+        pm = PluginManager()
+        pm._allow_community_sideload = allow_sideload
+        # Whitelist the plugin ids we'll create below.
+        for pid in ("signed_pkg", "unsigned_pkg", "unsigned_pro"):
+            pm._allowed_modules.add(f"external_plugins.{pid}")
+        return pm
+
+    def test_signed_package_loads(
+        self, app, tmp_path, signing_keypair, caplog
+    ):
+        with app.app_context():
+            build_package_dir(tmp_path, "signed_pkg", sign_key=signing_keypair)
+            pm = self._fresh_manager(allow_sideload=False)
+            before = set(pm.plugins.keys())
+
+            pm._load_package_plugins(str(tmp_path))
+
+            new = set(pm.plugins.keys()) - before
+            assert any("signed" in n for n in new), (
+                f"Signed package must load; new plugins={new}"
             )
 
-    def test_signing_guide_includes_upload_instructions(self):
-        """Signing guide explains how to submit plugins for signing."""
-        guide_path = Path("docs/PLUGIN_SIGNING.md")
-        if guide_path.exists():
-            content = guide_path.read_text()
-            assert "upload" in content.lower() or "submit" in content.lower(), (
-                "Guide must explain how to upload/submit plugins"
+    def test_unsigned_community_package_skipped_when_toggle_off(
+        self, app, tmp_path, signing_keypair, caplog
+    ):
+        with app.app_context():
+            build_package_dir(tmp_path, "unsigned_pkg")  # no sign_key
+            pm = self._fresh_manager(allow_sideload=False)
+            before = set(pm.plugins.keys())
+
+            with caplog.at_level("WARNING"):
+                pm._load_package_plugins(str(tmp_path))
+
+            new = set(pm.plugins.keys()) - before
+            assert not any("unsigned_pkg" in n for n in new), (
+                f"Unsigned community package must be skipped when toggle "
+                f"off; got new plugins={new}"
             )
+            assert any(
+                "unsigned_pkg" in rec.message and "signature" in rec.message
+                for rec in caplog.records
+            ), "Skip must produce a WARNING naming the plugin and signature"
+
+    def test_unsigned_community_package_loaded_when_toggle_on(
+        self, app, tmp_path, signing_keypair, caplog
+    ):
+        with app.app_context():
+            build_package_dir(tmp_path, "unsigned_pkg")
+            pm = self._fresh_manager(allow_sideload=True)
+            before = set(pm.plugins.keys())
+
+            with caplog.at_level("WARNING"):
+                pm._load_package_plugins(str(tmp_path))
+
+            new = set(pm.plugins.keys()) - before
+            assert any("unsigned_pkg" in n for n in new), (
+                f"With toggle on, unsigned community must load; new={new}"
+            )
+            assert any(
+                "UNSIGNED" in rec.message and "unsigned_pkg" in rec.message
+                for rec in caplog.records
+            ), "Load-with-toggle must produce a WARNING naming the plugin"
+
+    def test_unsigned_pro_package_always_refused(
+        self, app, tmp_path, signing_keypair, caplog, monkeypatch
+    ):
+        """Pro-tier unsigned packages must be refused even with toggle on."""
+        # Make the licence service accept 'pro' so we get past the tier gate
+        # and hit the signature gate.
+        monkeypatch.setattr(
+            "services.license_service.LicenseService.is_tier_allowed",
+            lambda self, tier: True,
+        )
+        with app.app_context():
+            build_package_dir(tmp_path, "unsigned_pro", tier="pro")
+            pm = self._fresh_manager(allow_sideload=True)
+            before = set(pm.plugins.keys())
+
+            with caplog.at_level("WARNING"):
+                pm._load_package_plugins(str(tmp_path))
+
+            new = set(pm.plugins.keys()) - before
+            assert not any("unsigned_pro" in n for n in new), (
+                "Pro-tier package without signature must be refused even "
+                f"when allow_community_sideload=true; got new={new}"
+            )
+
+
+# =========================================================================
+# PluginManager — loose .py sideload enforcement
+# =========================================================================
+
+
+class TestLoosePySideloadGate:
+    """_load_external_plugins_directory() checks .py.sig before importing."""
+
+    def _fresh_manager(self, allow_sideload: bool) -> PluginManager:
+        pm = PluginManager()
+        pm._allow_community_sideload = allow_sideload
+        for name in ("signed_loose", "unsigned_loose"):
+            pm._allowed_modules.add(f"external_plugins.{name}")
+        return pm
+
+    def test_signed_loose_py_loads(
+        self, app, tmp_path, signing_keypair, caplog
+    ):
+        with app.app_context():
+            py = _write_loose_plugin(tmp_path, "signed_loose")
+            _sign_loose_py(py, signing_keypair)
+            pm = self._fresh_manager(allow_sideload=False)
+
+            pm._load_external_plugins_directory(str(tmp_path))
+            # No skip warning for signed_loose
+            skips = [
+                r for r in caplog.records
+                if "signed_loose" in r.message and "Skipping" in r.message
+            ]
+            assert not skips, (
+                f"Signed loose .py must not be skipped; skips={skips}"
+            )
+
+    def test_unsigned_loose_py_skipped_when_toggle_off(
+        self, app, tmp_path, signing_keypair, caplog
+    ):
+        with app.app_context():
+            _write_loose_plugin(tmp_path, "unsigned_loose")
+            pm = self._fresh_manager(allow_sideload=False)
+
+            with caplog.at_level("WARNING"):
+                pm._load_external_plugins_directory(str(tmp_path))
+
+            assert any(
+                "unsigned_loose" in rec.message
+                and "signature" in rec.message
+                for rec in caplog.records
+            ), (
+                "Unsigned loose .py must produce a WARNING mentioning "
+                "the file and signature status"
+            )
+
+    def test_unsigned_loose_py_loaded_when_toggle_on(
+        self, app, tmp_path, signing_keypair, caplog
+    ):
+        with app.app_context():
+            _write_loose_plugin(tmp_path, "unsigned_loose")
+            pm = self._fresh_manager(allow_sideload=True)
+
+            with caplog.at_level("WARNING"):
+                pm._load_external_plugins_directory(str(tmp_path))
+
+            assert any(
+                "UNSIGNED" in rec.message and "unsigned_loose" in rec.message
+                for rec in caplog.records
+            ), (
+                "With toggle on, unsigned loose .py must load with an "
+                "UNSIGNED WARNING naming the file"
+            )
+
+
+# =========================================================================
+# PluginManager — config reading
+# =========================================================================
+
+
+class TestAllowCommunitySideloadConfig:
+    """_load_allowed_plugins_config() reads the new plugin_settings key."""
+
+    def test_default_is_false(self):
+        pm = PluginManager()
+        # Real config: allow_community_sideload: false in plugins.yaml
+        assert pm._allow_community_sideload is False, (
+            "Ship default must be false — operators opt in explicitly"
+        )
+
+    def test_toggle_persists_after_reload(self, monkeypatch):
+        pm = PluginManager()
+        pm._allow_community_sideload = True  # simulate operator toggled
+        pm.reload_plugin_config()
+        # After reload it should re-read the shipped config, which is false
+        assert pm._allow_community_sideload is False
+
+
+# =========================================================================
+# Digest contract — lock the digest algorithm so external signers
+# and the verifier here cannot silently
+# drift. If these break, the signing tool over there is producing
+# signatures TrakBridge will refuse.
+# =========================================================================
+
+
+class TestSignatureDigestContract:
+    """Signatures produced against the documented digest verify cleanly."""
+
+    def test_package_digest_matches_verifier(
+        self, tmp_path, signing_keypair
+    ):
+        pkg = build_package_dir(tmp_path, "digest_pkg")
+        # Reproduce what an external signer does: sha256 canonical
+        # package digest, Ed25519 sign, base64 in signature.sig.
+        digest = canonical_package_digest(pkg)
+        signature = signing_keypair.sign(digest)
+        (pkg / "signature.sig").write_text(
+            base64.b64encode(signature).decode("ascii") + "\n"
+        )
+        assert verify_package_signature(pkg) == "verified"
+
+    def test_loose_py_digest_matches_verifier(
+        self, tmp_path, signing_keypair
+    ):
+        py = _write_loose_plugin(tmp_path, "digest_loose")
+        # Loose-file digest = sha256 of raw bytes.
+        digest = hashlib.sha256(py.read_bytes()).digest()
+        signature = signing_keypair.sign(digest)
+        py.with_suffix(".py.sig").write_text(
+            base64.b64encode(signature).decode("ascii") + "\n"
+        )
+        assert verify_single_file_signature(py) == "verified"

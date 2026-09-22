@@ -89,3 +89,51 @@ def verify_package_signature(
     except (InvalidSignature, ValueError, TypeError) as e:
         logger.warning(f"Package signature verification failed: {e}")
         return "invalid"
+
+
+def verify_single_file_signature(
+    py_path: Path, public_key_b64: Optional[str] = "__EMBEDDED__"
+) -> str:
+    """Verify a loose sideloaded .py file's <name>.py.sig signature.
+
+    Digest is sha256 over the raw file bytes only — there is no
+    manifest, no other files, so the package-digest spec doesn't apply.
+    The sig file must sit next to the .py with `.sig` appended
+    (e.g. custom_plugin.py + custom_plugin.py.sig).
+
+    Returns "verified", "unsigned", or "invalid" (matches the package
+    verifier's contract so callers can use one code path).
+    """
+    py_path = Path(py_path)
+    sig_path = py_path.with_suffix(py_path.suffix + ".sig")
+    if not sig_path.is_file():
+        return "unsigned"
+
+    if public_key_b64 == "__EMBEDDED__":
+        from services.license_service import EMBEDDED_LICENSE_PUBLIC_KEY
+
+        public_key_b64 = EMBEDDED_LICENSE_PUBLIC_KEY
+
+    if not public_key_b64:
+        logger.warning(
+            "File is signed but no signing public key is embedded — "
+            "treating signature as invalid"
+        )
+        return "invalid"
+
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    try:
+        signature = base64.b64decode(sig_path.read_text().strip(), validate=True)
+        public_key = Ed25519PublicKey.from_public_bytes(
+            base64.b64decode(public_key_b64)
+        )
+        digest = hashlib.sha256(py_path.read_bytes()).digest()
+        public_key.verify(signature, digest)
+        return "verified"
+    except (InvalidSignature, ValueError, TypeError) as e:
+        logger.warning(
+            f"File signature verification failed for {py_path.name}: {e}"
+        )
+        return "invalid"
