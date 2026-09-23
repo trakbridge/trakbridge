@@ -1272,6 +1272,47 @@ def setup_error_handlers(app):
             logger.warning(f"Failed to rollback session in 503 handler: {e}")
         return render_template("errors/503.html"), 503
 
+    from werkzeug.exceptions import HTTPException
+
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(e):
+        """Preserve HTTP-status exceptions (429, etc.) as their own response.
+
+        Without this, the catch-all `handle_exception` below swallows
+        `HTTPException` — Flask-Limiter's 429 was being converted into a
+        500 "This page isn't working" error, hiding the real reason.
+
+        Renders a friendly HTML template for browser callers when
+        available; falls back to JSON for API clients or if no template
+        exists.
+        """
+        # Log rate-limit hits at WARNING so operators see brute-force
+        # signals. Other HTTP exceptions (404, 400, 405, ...) already
+        # have dedicated handlers above or are not worth per-hit logging.
+        if e.code == 429:
+            logger.warning(
+                f"Rate limit exceeded for {request.remote_addr} at "
+                f"{request.endpoint}: {e.description}"
+            )
+
+        wants_json = (
+            request.is_json
+            or request.content_type == "application/json"
+            or "application/json" in (request.headers.get("Accept") or "")
+        )
+        if wants_json:
+            return (
+                jsonify({"error": e.name, "description": e.description}),
+                e.code,
+            )
+
+        template = f"errors/{e.code}.html"
+        try:
+            return render_template(template), e.code
+        except Exception:
+            # No template for this status — return the Werkzeug default.
+            return e.get_response()
+
     @app.errorhandler(Exception)
     def handle_exception(e):
         """Handle uncaught exceptions"""
