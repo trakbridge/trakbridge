@@ -7,6 +7,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
 import threading
 import time
 from typing import Dict, List
@@ -135,10 +136,19 @@ def _validate_coordinates(locations: List[Dict]) -> str | None:
     for loc in locations:
         lat = loc.get("lat")
         lon = loc.get("lon")
-        if lat is not None and (lat < -90 or lat > 90):
-            return f"Invalid coordinate: latitude {lat} outside ±90 range"
-        if lon is not None and (lon < -180 or lon > 180):
-            return f"Invalid coordinate: longitude {lon} outside ±180 range"
+        # T5.4: NaN and +/-inf silently pass `<` and `>` comparisons
+        # because they return False for both. Reject them explicitly
+        # so bogus values never reach the CoT XML builder.
+        if lat is not None:
+            if not isinstance(lat, (int, float)) or not math.isfinite(lat):
+                return f"Invalid coordinate: latitude {lat!r} is not a finite number"
+            if lat < -90 or lat > 90:
+                return f"Invalid coordinate: latitude {lat} outside ±90 range"
+        if lon is not None:
+            if not isinstance(lon, (int, float)) or not math.isfinite(lon):
+                return f"Invalid coordinate: longitude {lon!r} is not a finite number"
+            if lon < -180 or lon > 180:
+                return f"Invalid coordinate: longitude {lon} outside ±180 range"
     return None
 
 
