@@ -78,6 +78,26 @@ What was missing: the `source_filter` field wasn't validated at save time. Bad e
 
 ---
 
+### FEED-CONTENT INJECTION HARDENING
+
+#### IRC handler strips CRLF from message payloads
+**T5.2 — protocol-command injection via CoT-derived field values**
+
+IRC uses `\r\n` as a command separator. TrakBridge's IRC handler renders CoT-derived values (callsign, remarks, group name) into a message template and writes the result to the socket verbatim. A callsign like `alice\r\nJOIN #evil\r\nPRIVMSG #evil :owned` would be split by the IRC server into three separate commands executed with the bot's privileges. Same class of bug as SQL injection, just against IRC instead of SQL.
+
+Fixed at the socket-write chokepoint in `plugins/irc_handler.py:_send_to_irc()`: a new `_sanitize_irc_payload()` helper replaces CR/LF with a single space and drops NUL bytes. Both the message body AND the channel name get sanitised — belt-and-braces against a compromised config file trying to inject via the channel field.
+
+Regression tests cover every combination of `\r`, `\n`, `\r\n`, and `\x00`, plus a clean-message pass-through guard.
+
+#### Inbound coordinate validator rejects NaN and infinity
+**T5.4 — bogus floats slipped past the bounds check into CoT XML**
+
+`float('nan') < -90` returns False. `float('nan') > 90` returns False. The previous `_validate_coordinates()` at `routes/inbound.py:128` used only bounds comparisons, so NaN, +inf, and -inf slid through and reached the CoT XML builder — where they either crashed pytak, produced invalid XML clients couldn't render, or manifested as broken map geometry.
+
+Added a `math.isfinite()` guard with an unambiguous error message naming the offending value. String values (from surprise upstream type coercion) also fail cleanly at the same guard. Valid coordinates including the extremes (`±90`, `±180`) still pass — regression-guarded.
+
+---
+
 ### DEPENDENCY VULNERABILITY SWEEP
 
 #### Trivy scan cleared — pip / setuptools / msgpack floors added
