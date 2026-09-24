@@ -126,24 +126,102 @@ class TestAccountLockout:
                 "refused. Existing behaviour — regression guard."
             )
 
-    def test_expired_locked_until_reports_not_locked(self, app, db_session):
-        """locked_until in the past AND status==ACTIVE → is_locked False.
-
-        `is_locked()` returns True if EITHER the status is LOCKED or the
-        locked_until timestamp is in the future. So to prove the
-        timestamp-only path we must leave status as ACTIVE.
-        """
+    def test_expired_locked_until_reports_not_locked_active_status(
+        self, app, db_session
+    ):
+        """locked_until in the past AND status==ACTIVE → is_locked False."""
         with app.app_context():
-            uid = _create_lockout_user("expired_lock")
+            uid = _create_lockout_user("expired_active")
             u = User.query.get(uid)
             u.locked_until = datetime.now(timezone.utc) - timedelta(minutes=1)
-            u.status = AccountStatus.ACTIVE  # only the timestamp gates
+            u.status = AccountStatus.ACTIVE
             db.session.commit()
 
             refreshed = User.query.get(uid)
             assert not refreshed.is_locked(), (
                 "locked_until in the past on an ACTIVE account must "
                 "report is_locked=False"
+            )
+
+    def test_expired_locked_until_auto_unlocks_locked_status(
+        self, app, db_session
+    ):
+        """Regression: lock_account() sets BOTH locked_until and
+        status=LOCKED. When the window expires, is_locked() must lazily
+        drop status back to ACTIVE and clear the counter — otherwise
+        the account stays locked forever despite the "temporary" 30-min
+        window, requiring an admin unlock every time.
+
+        This is the actual behaviour a user hits: 5 failed logins →
+        locked → wait 31 minutes → try correct password → still refused.
+        """
+        with app.app_context():
+            uid = _create_lockout_user("expired_locked_status")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)  # sets locked_until AND status
+            u.failed_login_attempts = 5
+            db.session.commit()
+
+            # Simulate the passage of time by rewriting locked_until to the past
+            u.locked_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+            db.session.commit()
+
+            refreshed = User.query.get(uid)
+            assert not refreshed.is_locked(), (
+                "Expired lockout on a LOCKED account must auto-unlock "
+                "on the next is_locked() check"
+            )
+            # And the auto-unlock must have persisted
+            re_refreshed = User.query.get(uid)
+            assert re_refreshed.status == AccountStatus.ACTIVE
+            assert re_refreshed.locked_until is None
+            assert re_refreshed.failed_login_attempts == 0
+
+    def test_expired_lockout_lets_user_log_in_with_correct_password(
+        self, app, db_session
+    ):
+        """End-to-end: after the window expires, authenticate() should
+        succeed with the correct password. This is the user-facing
+        contract that a 'temporary' lockout implies."""
+        with app.app_context():
+            uid = _create_lockout_user("expired_login")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)
+            db.session.commit()
+
+            # Fast-forward
+            u.locked_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+            db.session.commit()
+
+            provider = LocalAuthProvider(LOCAL_CONFIG)
+            response = provider.authenticate(
+                "expired_login", "CorrectPass123"
+            )
+            assert response.success is True, (
+                "After the lockout window has passed, the correct password "
+                "must succeed. If this fails, users are permanently "
+                "locked out despite the 30-min 'temporary' window."
+            )
+
+    def test_active_lockout_still_blocks_correct_password(
+        self, app, db_session
+    ):
+        """Complement: while the window is still active, the correct
+        password must remain refused. Ensures the auto-unlock fix
+        didn't accidentally weaken protection."""
+        with app.app_context():
+            uid = _create_lockout_user("active_lockout")
+            u = User.query.get(uid)
+            u.lock_account(duration_minutes=30)  # future timestamp
+            db.session.commit()
+
+            provider = LocalAuthProvider(LOCAL_CONFIG)
+            response = provider.authenticate(
+                "active_lockout", "CorrectPass123"
+            )
+            assert response.success is False, (
+                "Correct password on an actively-locked account must "
+                "still be refused"
             )
 
 
