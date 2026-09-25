@@ -376,22 +376,29 @@ class UdpMulticastListener(BaseInboundPlugin):
 
         import ipaddress
 
+        # T1.2: raise ValueError (not just return False) so
+        # update_stream_safely() surfaces the reason in the UI —
+        # matches the T1.3 pattern. Returning False alone got swallowed
+        # by the save-time hook, letting invalid configs persist.
         group = str(self.config.get("multicast_group", "") or "")
         if group:
             try:
                 addr = ipaddress.ip_address(group)
                 if not addr.is_multicast:
-                    logger.error(
-                        f"UDP multicast: multicast_group '{group}' is not "
-                        "a multicast address (224.0.0.0/4)"
+                    raise ValueError(
+                        f"Multicast Group '{group}' is not a multicast "
+                        "address. Use an IPv4 address in 224.0.0.0/4 "
+                        "(for example 239.2.3.1)."
                     )
-                    return False
-            except ValueError:
-                logger.error(
-                    f"UDP multicast: multicast_group '{group}' is not "
-                    "a valid IP address"
+            except ValueError as e:
+                # ip_address() raises ValueError for malformed input;
+                # our own raise above lands here too. Re-raise with a
+                # user-readable message.
+                if "is not a multicast address" in str(e):
+                    raise
+                raise ValueError(
+                    f"Multicast Group '{group}' is not a valid IP address."
                 )
-                return False
 
         source_filter = str(self.config.get("source_filter") or "")
         if source_filter.strip():
@@ -402,12 +409,12 @@ class UdpMulticastListener(BaseInboundPlugin):
                 try:
                     ipaddress.ip_address(entry)
                 except ValueError:
-                    logger.error(
-                        f"UDP multicast: source_filter entry '{entry}' "
-                        "is not a valid IPv4 address. SSM requires exact "
-                        "source IPs, not CIDRs."
+                    raise ValueError(
+                        f"Source Filter entry '{entry}' is not a valid "
+                        "IPv4 address. SSM requires exact source IPs, "
+                        "not CIDR blocks — for example "
+                        "'10.0.0.5, 10.0.0.6'."
                     )
-                    return False
 
         return True
 

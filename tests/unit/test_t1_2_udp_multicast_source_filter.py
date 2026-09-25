@@ -22,6 +22,8 @@ import socket
 import socket as _real_socket
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from plugins.udp_multicast_listener import (
     UdpMulticastListener,
     _IP_ADD_SOURCE_MEMBERSHIP,
@@ -175,16 +177,21 @@ class TestSocketJoinBehavior:
 
 
 class TestConfigValidation:
-    """validate_config() catches bad IPs before _open_socket() is called."""
+    """validate_config() catches bad IPs before _open_socket() is called.
+
+    Invalid configs raise ValueError with an operator-readable message so
+    update_stream_safely()/create_stream() can surface the reason in the
+    UI — matches the T1.3 pattern. Returning False alone got swallowed
+    by the save-time hook, letting invalid configs persist.
+    """
 
     def test_invalid_ip_in_source_filter_rejected(self):
         plugin = UdpMulticastListener(config={
             **_MIN_CONFIG,
             "source_filter": "10.0.0.5, not-an-ip",
         })
-        assert not plugin.validate_config(), (
-            "Invalid IP in source_filter must fail validation"
-        )
+        with pytest.raises(ValueError, match=r"not-an-ip"):
+            plugin.validate_config()
 
     def test_cidr_in_source_filter_rejected(self):
         """SSM requires exact IPs; CIDRs are not valid mreq source addrs."""
@@ -192,33 +199,113 @@ class TestConfigValidation:
             **_MIN_CONFIG,
             "source_filter": "10.0.0.0/24",
         })
-        assert not plugin.validate_config(), (
-            "CIDR in source_filter must fail validation"
-        )
+        with pytest.raises(ValueError, match=r"10\.0\.0\.0/24"):
+            plugin.validate_config()
 
     def test_valid_source_filter_passes_validation(self):
         plugin = UdpMulticastListener(config={
             **_MIN_CONFIG,
             "source_filter": "10.0.0.5, 10.0.0.6",
         })
-        assert plugin.validate_config()
+        assert plugin.validate_config() is True
 
     def test_empty_source_filter_passes_validation(self):
         plugin = UdpMulticastListener(config={**_MIN_CONFIG})
-        assert plugin.validate_config()
+        assert plugin.validate_config() is True
 
     def test_non_multicast_group_rejected(self):
         plugin = UdpMulticastListener(config={
             **_MIN_CONFIG,
             "multicast_group": "10.0.0.1",
         })
-        assert not plugin.validate_config(), (
-            "Unicast address as multicast_group must fail validation"
-        )
+        with pytest.raises(ValueError, match=r"not a multicast address"):
+            plugin.validate_config()
 
     def test_invalid_group_address_rejected(self):
         plugin = UdpMulticastListener(config={
             **_MIN_CONFIG,
             "multicast_group": "not-an-ip",
         })
-        assert not plugin.validate_config()
+        with pytest.raises(ValueError, match=r"not a valid IP"):
+            plugin.validate_config()
+
+
+class TestSaveTimeValidationRejectsInvalidUdpConfig:
+    """Regression: both create_stream() and update_stream_safely() must
+    surface UDP validator errors to the UI, not silently persist the
+    invalid config. Reported live — the initial fix only wired the
+    probe into update_stream_safely(); create_stream() had no probe
+    at all, so freshly-created streams saved invalid configs and the
+    error only appeared when the listener tried to start.
+    """
+
+    def test_create_stream_rejects_invalid_multicast_group(
+        self, app, db_session
+    ):
+        from unittest.mock import MagicMock
+        from models.tak_server import TakServer
+        from services.stream_operations_service import StreamOperationsService
+
+        with app.app_context():
+            server = TakServer(
+                name="udp-s1", host="h1", port=8089, protocol="ssl"
+            )
+            db_session.add(server)
+            db_session.commit()
+
+            stream_mgr = MagicMock()
+            stream_mgr.refresh_stream_tak_workers.return_value = True
+            svc = StreamOperationsService(stream_mgr, db_session)
+
+            result = svc.create_stream({
+                "name": "Bad UDP Group",
+                "plugin_type": "udp_multicast_listener",
+                "tak_servers": [str(server.id)],
+                "plugin_multicast_group": "10.0.0.1",  # unicast, not multicast
+                "plugin_multicast_port": "6969",
+                "plugin_bind_interface": "0.0.0.0",
+            })
+
+            assert result["success"] is False, (
+                "create_stream must refuse a non-multicast multicast_group; "
+                f"got {result}"
+            )
+            assert "multicast" in result["error"].lower(), (
+                f"Error message must mention 'multicast'; got {result['error']}"
+            )
+
+    def test_create_stream_rejects_invalid_source_filter(
+        self, app, db_session
+    ):
+        from unittest.mock import MagicMock
+        from models.tak_server import TakServer
+        from services.stream_operations_service import StreamOperationsService
+
+        with app.app_context():
+            server = TakServer(
+                name="udp-s2", host="h1", port=8089, protocol="ssl"
+            )
+            db_session.add(server)
+            db_session.commit()
+
+            stream_mgr = MagicMock()
+            stream_mgr.refresh_stream_tak_workers.return_value = True
+            svc = StreamOperationsService(stream_mgr, db_session)
+
+            result = svc.create_stream({
+                "name": "Bad UDP Filter",
+                "plugin_type": "udp_multicast_listener",
+                "tak_servers": [str(server.id)],
+                "plugin_multicast_group": "239.2.3.1",
+                "plugin_multicast_port": "6969",
+                "plugin_bind_interface": "0.0.0.0",
+                "plugin_source_filter": "10.0.0.5, not-an-ip",
+            })
+
+            assert result["success"] is False, (
+                "create_stream must refuse a source_filter with an invalid "
+                f"IP; got {result}"
+            )
+            assert "not-an-ip" in result["error"], (
+                f"Error must name the bad entry; got {result['error']}"
+            )

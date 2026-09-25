@@ -211,3 +211,86 @@ class TestCheckIpAllowlistRuntime:
         assert _check_ip_allowlist(
             "definitely not an ip", "10.0.0.5"
         ) is False
+
+
+class TestSaveTimeValidationRejectsInvalidAuthMode:
+    """Regression: create_stream() must probe validate_config() too.
+
+    Reported live — the initial 2.2.1 fix only wired the probe into
+    update_stream_safely(). A freshly-created stream with
+    auth_mode=none and no ip_allowlist saved silently, and the error
+    only surfaced when the listener tried to start.
+    """
+
+    def test_create_stream_rejects_auth_mode_none_without_allowlist(
+        self, app, db_session
+    ):
+        from unittest.mock import MagicMock
+        from models.tak_server import TakServer
+        from services.stream_operations_service import StreamOperationsService
+
+        with app.app_context():
+            server = TakServer(
+                name="json-s1", host="h1", port=8089, protocol="ssl"
+            )
+            db_session.add(server)
+            db_session.commit()
+
+            stream_mgr = MagicMock()
+            stream_mgr.refresh_stream_tak_workers.return_value = True
+            svc = StreamOperationsService(stream_mgr, db_session)
+
+            result = svc.create_stream({
+                "name": "Bad JSON Auth",
+                "plugin_type": "generic_json_inbound",
+                "tak_servers": [str(server.id)],
+                "plugin_auth_mode": "none",
+                "plugin_ip_allowlist": "",  # missing — must be rejected
+                "plugin_lat_field": "lat",
+                "plugin_lon_field": "lon",
+                "plugin_uid_field": "id",
+                "plugin_callsign_field": "name",
+            })
+
+            assert result["success"] is False, (
+                "create_stream must refuse auth_mode=none with empty "
+                f"ip_allowlist; got {result}"
+            )
+            assert "allowlist" in result["error"].lower(), (
+                f"Error must mention allowlist; got {result['error']}"
+            )
+
+    def test_create_stream_rejects_invalid_ip_in_allowlist(
+        self, app, db_session
+    ):
+        from unittest.mock import MagicMock
+        from models.tak_server import TakServer
+        from services.stream_operations_service import StreamOperationsService
+
+        with app.app_context():
+            server = TakServer(
+                name="json-s2", host="h1", port=8089, protocol="ssl"
+            )
+            db_session.add(server)
+            db_session.commit()
+
+            stream_mgr = MagicMock()
+            stream_mgr.refresh_stream_tak_workers.return_value = True
+            svc = StreamOperationsService(stream_mgr, db_session)
+
+            result = svc.create_stream({
+                "name": "Bad JSON IP",
+                "plugin_type": "generic_json_inbound",
+                "tak_servers": [str(server.id)],
+                "plugin_auth_mode": "none",
+                "plugin_ip_allowlist": "10.0.0.5, not-an-ip",
+                "plugin_lat_field": "lat",
+                "plugin_lon_field": "lon",
+                "plugin_uid_field": "id",
+                "plugin_callsign_field": "name",
+            })
+
+            assert result["success"] is False
+            assert "not-an-ip" in result["error"], (
+                f"Error must name the bad entry; got {result['error']}"
+            )
