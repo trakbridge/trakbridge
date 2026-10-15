@@ -2,10 +2,10 @@
 
 ## Version 2.2.1 - Threat-Model Follow-Up & Sideload Signature Enforcement
 
-**Release Date:** September 22, 2026
+**Release Date:** October 15, 2026
 **Focus: Closing the remaining 2.2.0-triage security items — LDAP secure-by-default, inbound anonymous-injection gate, plugin sideload signature enforcement, admin unlock action, UDP source filter validation, and an image-scan vulnerability sweep**
 
-TrakBridge 2.2.1 is a security patch release that closes every item deferred from 2.2.0's threat-model triage. Nothing in this release changes user-visible workflows; the surface area is defensive. If 2.2.0 was "close the big attack paths and land the SDK", 2.2.1 is "no more silent no-ops in the auth stack, and every code-loading path enforces its signature check".
+TrakBridge 2.2.1 is a security patch release that closes every item deferred from 2.2.0's threat-model triage. 
 
 This is a straight upgrade from 2.2.0 — no schema migration, no new required secrets. Two configuration behaviours change in ways that could affect running deployments: LDAP configs that were relying on `use_tls: true` actually working (it wasn't) will now fail if the directory server doesn't accept StartTLS, and unsigned files in `external_plugins/` will be refused at startup unless an operator opts in. Both are covered under Upgrade Notes.
 
@@ -34,6 +34,13 @@ The generic JSON and XML inbound plugins accept `auth_mode: none` for testing co
 `validate_config()` on both plugins now raises with a user-readable message when `auth_mode=none` is chosen without an `ip_allowlist`. `0.0.0.0/0` is accepted as an explicit wildcard, so operators who genuinely need an open endpoint can preserve that behaviour — but it's now an auditable config entry rather than an implicit default. Every other value must parse as an IP address or CIDR block.
 
 The runtime side had a working `_check_ip_allowlist()` already; it's been widened to accept both the legacy JSON-array format (backward compatible for existing streams) and the new comma/newline-separated text the UI now exposes. Malformed values fail closed — no accidental deny-to-allow conversion during upgrade. Save-time validation is wired into `update_stream_safely()` so the error surfaces in the UI immediately, not just when the listener next starts.
+
+#### Validation runs on stream create too
+**Closing the create-path gap for every inbound plugin**
+
+The save-time probe originally only ran on update. `create_stream()` skipped it entirely, so a brand-new stream with `auth_mode=none` and an empty allowlist saved without complaint and only failed when the listener tried to start. The same probe-and-catch block now runs immediately after `set_plugin_config()` on create, and the error flashes back to the edit form exactly as it does on update.
+
+The UDP multicast listener had a related defect: its `validate_config()` returned False with a log line instead of raising `ValueError`, and the save-time hook only catches `ValueError`. Invalid multicast groups and source filters were therefore swallowed on both create and update. Every failure path now raises with a message naming the offending field and value, so UDP and the generic inbound plugins behave identically.
 
 ---
 
@@ -112,6 +119,27 @@ None of the CVEs is a direct runtime attack vector against TrakBridge — pip/se
 Floors are not equality pins — the resolver stays free to pick newer versions, but nothing below the fixed threshold can resolve. Rebuild the image and re-run Trivy to pick up the fix; existing running containers keep their old versions.
 
 CVEs closed: GHSA-6v7p-g79w-8964, GHSA-4xh5-x5gv-qwph, GHSA-qwm4-qh6w-59xr, GHSA-58qw-9mgm-455v, GHSA-jp4c-xjxw-mgf9, GHSA-wf93-45jw-7689, GHSA-6vgw-5pg2-w6jp, CVE-2025-47273, CVE-2026-59890.
+
+---
+
+### AUTH & ERROR HANDLING FIXES
+
+#### Lockouts are actually temporary
+**Accounts auto-unlock once `locked_until` passes**
+
+`lock_account()` set both a `locked_until` timestamp and `status = LOCKED`, but `is_locked()` only looked at the status. The 30-minute window was decorative — once locked, a user stayed locked until an admin clicked Unlock, and every five-typo login became a support ticket.
+
+`is_active()` and `is_locked()` now check the timestamp first and lazily clear an expired lock: `locked_until` is cleared, `failed_login_attempts` resets to 0, and status flips back to ACTIVE. No background scheduler is needed — the unlock happens at exactly the point that would otherwise refuse the user. DISABLED accounts are never touched.
+
+#### Rate-limit responses return 429, not 500
+**HTTPException status preserved through the error handler chain**
+
+The catch-all `@app.errorhandler(Exception)` was catching Flask-Limiter's `HTTPException` and rendering it as a generic 500 "This page isn't working". A user who hit the login rate limit got a misleading server error instead of being told to slow down.
+
+A dedicated `HTTPException` handler now runs first and content-negotiates the response: JSON `{error, description}` for API clients, the matching `errors/<code>.html` template for browsers, and Werkzeug's default response (with the correct status and `Retry-After` header) as a fallback. 429 hits log a WARNING naming the source IP and endpoint so brute-force signals stay visible to operators.
+
+#### Error pages match the rest of the app
+The error templates used a purple gradient, system fonts, and emoji icons that didn't match the app. `base_error.html` now uses the app's palette, Inter font, and Font Awesome icons, with a new 429 rate-limit page alongside the existing ones. The 404 and 503 templates had been wrapped in HTML comments and now render correctly.
 
 ---
 
