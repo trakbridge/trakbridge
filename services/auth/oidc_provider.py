@@ -78,6 +78,12 @@ from .base_provider import (
 # Module-level logger
 logger = get_module_logger(__name__)
 
+# Name given to the single provider when config uses the flat schema
+FLAT_PROVIDER_NAME = "oidc"
+
+# Standard OIDC discovery path (RFC 8414 / OpenID Connect Discovery 1.0)
+DISCOVERY_WELL_KNOWN_PATH = ".well-known/openid-configuration"
+
 
 class OIDCAuthProvider(BaseAuthenticationProvider):
     """
@@ -103,6 +109,14 @@ class OIDCAuthProvider(BaseAuthenticationProvider):
         # Provider configuration using ConfigHelper
         helper = ConfigHelper(config)
         self.providers_config = helper.get("providers", {})
+        if not self.providers_config and self._is_flat_config(config):
+            # authentication.yaml emits a single flat OIDC block (issuer,
+            # client_id, scopes, role_mapping at the top level) rather than a
+            # providers map. Normalise it so the rest of the class sees one
+            # enabled provider.
+            self.providers_config = {
+                FLAT_PROVIDER_NAME: self._normalize_flat_config(config)
+            }
         self.active_provider = self._determine_active_provider()
 
         if not self.active_provider:
@@ -117,22 +131,25 @@ class OIDCAuthProvider(BaseAuthenticationProvider):
         self.discovery_url = provider_helper.get("discovery_url", "")
         self.scope = provider_helper.get("scope", "openid profile email")
 
-        super().__init__(AuthProvider.OIDC, config)
-
-        # Role mapping
-        self.role_mappings = self.config.get("role_mappings", {})
-        self.default_role = UserRole(self.config.get("default_role", "user"))
-
-        # Settings
-        self.auto_create_users = self.config.get("auto_create_users", True)
-        self.update_user_info = self.config.get("update_user_info", True)
-
-        # Discovery and JWKS caching
+        # Discovery and JWKS caching (needed before base class validation,
+        # which fetches the discovery document)
         self._discovery_cache = {}
         self._jwks_cache = {}
         self._cache_ttl = 3600  # 1 hour
         self._last_discovery_fetch = {}
         self._last_jwks_fetch = {}
+
+        super().__init__(AuthProvider.OIDC, config)
+
+        # Role mapping (flat schema spells the key "role_mapping")
+        self.role_mappings = self.config.get("role_mappings") or self.config.get(
+            "role_mapping", {}
+        )
+        self.default_role = UserRole(self.config.get("default_role", "user"))
+
+        # Settings
+        self.auto_create_users = self.config.get("auto_create_users", True)
+        self.update_user_info = self.config.get("update_user_info", True)
 
         # Initialize provider discovery
         self._load_discovery_document()
@@ -140,6 +157,37 @@ class OIDCAuthProvider(BaseAuthenticationProvider):
         logger.info(
             f"OIDC authentication provider initialized (provider: {self.active_provider})"
         )
+
+    @staticmethod
+    def _is_flat_config(config: Dict[str, Any]) -> bool:
+        """True when config is the flat single-provider schema from authentication.yaml"""
+        return any(key in config for key in ("issuer", "client_id", "discovery_url"))
+
+    @staticmethod
+    def _normalize_flat_config(config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Translate the flat authentication.yaml schema into a provider entry.
+
+        Derives discovery_url from issuer when not given explicitly, and joins
+        the scopes list into the space-separated scope string OIDC expects.
+        """
+        discovery_url = config.get("discovery_url", "")
+        issuer = config.get("issuer", "")
+        if not discovery_url and issuer:
+            discovery_url = f"{issuer.rstrip('/')}/{DISCOVERY_WELL_KNOWN_PATH}"
+
+        scope = config.get("scope", "")
+        scopes = config.get("scopes")
+        if not scope and scopes:
+            scope = " ".join(scopes)
+
+        return {
+            "enabled": True,
+            "client_id": config.get("client_id", ""),
+            "client_secret": config.get("client_secret", ""),
+            "discovery_url": discovery_url,
+            "scope": scope or "openid profile email",
+        }
 
     def _determine_active_provider(self) -> Optional[str]:
         """Determine which OIDC provider is active"""

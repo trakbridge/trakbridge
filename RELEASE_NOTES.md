@@ -138,6 +138,17 @@ The catch-all `@app.errorhandler(Exception)` was catching Flask-Limiter's `HTTPE
 
 A dedicated `HTTPException` handler now runs first and content-negotiates the response: JSON `{error, description}` for API clients, the matching `errors/<code>.html` template for browsers, and Werkzeug's default response (with the correct status and `Retry-After` header) as a fallback. 429 hits log a WARNING naming the source IP and endpoint so brute-force signals stay visible to operators.
 
+#### OIDC can actually be enabled
+**`OIDC_ENABLED=true` no longer dies at startup with "No OIDC provider is enabled"**
+
+Three separate breaks sat on the OIDC login path, and each one hid the next. First, `OIDCAuthProvider` only understood a nested multi-provider schema (`providers.<name>.discovery_url`, `scope` as a string, `role_mappings`) while `config/settings/authentication.yaml`, the docs, and `docker-compose.yml` all produce a flat block (`issuer`, `client_id`, `scopes` as a list, `role_mapping`). The LDAP provider had been taught to read both shapes in an earlier release; OIDC never was, so the constructor found no `providers` map and refused to start. The provider now normalises the flat schema the same way LDAP does: `discovery_url` is derived from `issuer` using the standard `/.well-known/openid-configuration` path (an explicit `discovery_url` still wins), the `scopes` list is joined into the space-separated `scope` string OIDC expects, and `role_mapping` is read as an alias of `role_mappings`. Existing nested configs are unaffected.
+
+Second, the discovery and JWKS cache dictionaries were created *after* the base-class constructor ran — and the base constructor validates the config, which fetches the discovery document, which reads the cache. Any real construction raised `AttributeError`. Every existing test had patched the fetch, so nothing noticed.
+
+Third, `configure_flask_app()` copies a fixed list of settings into Flask config and `APPLICATION_URL` was never on it. The OIDC login route builds its callback redirect from `current_app.config['APPLICATION_URL']` and raised `KeyError` on the first click. It is now copied like the rest.
+
+The new end-to-end test stands up a real local HTTP identity provider serving discovery and JWKS documents, enables OIDC through the flat schema, posts to `/auth/login`, and asserts the browser is redirected to the IdP's authorize endpoint with the right `client_id`, `scope`, `redirect_uri`, and session-bound `state`. No mocks on the path under test.
+
 #### Error pages match the rest of the app
 The error templates used a purple gradient, system fonts, and emoji icons that didn't match the app. `base_error.html` now uses the app's palette, Inter font, and Font Awesome icons, with a new 429 rate-limit page alongside the existing ones. The 404 and 503 templates had been wrapped in HTML comments and now render correctly.
 

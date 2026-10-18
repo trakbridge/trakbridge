@@ -737,6 +737,8 @@ def configure_flask_app(app, config_instance):
         config_instance.HTTP_MAX_CONNECTIONS_PER_HOST
     )
     app.config["ASYNC_TIMEOUT"] = config_instance.ASYNC_TIMEOUT
+    # Public base URL; the OIDC login route builds its callback redirect from it
+    app.config["APPLICATION_URL"] = config_instance.APPLICATION_URL
 
     # Logging settings
     app.config["LOG_LEVEL"] = config_instance.LOG_LEVEL
