@@ -3,169 +3,153 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title></title>
+    <title>{{ self.code() }} {{ self.heading() }} — TrakBridge</title>
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='favicon-32x32.png') }}">
+    <link rel="icon" type="image/png" sizes="16x16" href="{{ url_for('static', filename='favicon-16x16.png') }}">
+    <link href="{{ url_for('static', filename='css/google-fonts.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/bootstrap.min.css') }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/all.min.css') }}" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root {
+            /* Match the app palette from templates/base.html */
+            --primary-blue: #1e3a8a;
+            --primary-blue-light: #3b82f6;
+            --primary-blue-dark: #1e40af;
+            --gray-50: #f8fafc;
+            --gray-100: #f1f5f9;
+            --gray-200: #e2e8f0;
+            --gray-500: #64748b;
+            --gray-600: #475569;
+            --gray-700: #334155;
+            --gray-800: #1e293b;
+            --border-radius: 8px;
+            --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            --font-primary: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
         }
 
+        * { box-sizing: border-box; }
+
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: var(--font-primary);
+            background-color: var(--gray-50);
+            color: var(--gray-800);
             min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            color: #333;
+            margin: 0;
+            padding: 1rem;
+            line-height: 1.6;
         }
 
         .error-container {
-            background: rgba(255, 255, 255, 0.95);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
+            background: #ffffff;
+            border: 1px solid var(--gray-200);
+            border-radius: var(--border-radius);
             padding: 3rem 2rem;
             text-align: center;
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
-            max-width: 500px;
-            width: 90%;
-            margin: 1rem;
+            box-shadow: var(--shadow-lg);
+            max-width: 520px;
+            width: 100%;
         }
 
-        .error-code {
-            font-size: 6rem;
-            font-weight: 800;
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            margin-bottom: 0.5rem;
-            line-height: 1;
-        }
-
-        .error-title {
-            font-size: 1.8rem;
-            font-weight: 600;
-            color: #2d3748;
+        .error-icon {
+            font-size: 2.5rem;
+            color: var(--primary-blue);
             margin-bottom: 1rem;
         }
 
+        .error-code {
+            font-size: 4.5rem;
+            font-weight: 700;
+            color: var(--primary-blue);
+            line-height: 1;
+            margin-bottom: 0.5rem;
+            letter-spacing: -0.02em;
+        }
+
+        .error-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: var(--gray-800);
+            margin: 0 0 1rem 0;
+        }
+
         .error-message {
-            font-size: 1.1rem;
-            color: #718096;
-            line-height: 1.6;
-            margin-bottom: 2rem;
+            font-size: 1rem;
+            color: var(--gray-600);
+            margin: 0 0 2rem 0;
         }
 
         .error-actions {
             display: flex;
-            gap: 1rem;
+            gap: 0.75rem;
             justify-content: center;
             flex-wrap: wrap;
         }
 
         .btn {
-            padding: 0.75rem 1.5rem;
-            border: none;
-            border-radius: 8px;
-            font-size: 1rem;
+            padding: 0.625rem 1.25rem;
+            border-radius: var(--border-radius);
+            font-size: 0.9375rem;
             font-weight: 500;
+            font-family: var(--font-primary);
             text-decoration: none;
             cursor: pointer;
-            transition: all 0.3s ease;
+            transition: all 0.15s ease;
             display: inline-flex;
             align-items: center;
             gap: 0.5rem;
+            border: 1px solid transparent;
         }
 
         .btn-primary {
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            color: white;
+            background: var(--primary-blue);
+            color: #ffffff;
         }
 
         .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+            background: var(--primary-blue-dark);
+            color: #ffffff;
         }
 
         .btn-secondary {
-            background: #f7fafc;
-            color: #4a5568;
-            border: 2px solid #e2e8f0;
+            background: #ffffff;
+            color: var(--gray-700);
+            border-color: var(--gray-200);
         }
 
         .btn-secondary:hover {
-            background: #edf2f7;
-            transform: translateY(-2px);
-        }
-
-        .error-icon {
-            font-size: 3rem;
-            margin-bottom: 1rem;
+            background: var(--gray-100);
+            border-color: var(--gray-500);
         }
 
         @media (max-width: 480px) {
-            .error-code {
-                font-size: 4rem;
-            }
-
-            .error-title {
-                font-size: 1.5rem;
-            }
-
-            .error-actions {
-                flex-direction: column;
-            }
-
-            .btn {
-                width: 100%;
-                justify-content: center;
-            }
+            .error-code { font-size: 3.5rem; }
+            .error-title { font-size: 1.25rem; }
+            .error-actions { flex-direction: column; }
+            .btn { width: 100%; justify-content: center; }
         }
     </style>
 </head>
 <body>
     <div class="error-container">
-        <div class="error-icon">{% block icon %}❌{% endblock %}</div>
+        <div class="error-icon">
+            <i class="{% block icon %}fas fa-exclamation-triangle{% endblock %}" aria-hidden="true"></i>
+        </div>
         <div class="error-code">{% block code %}404{% endblock %}</div>
-        <h1 class="error-title">{% block title %}Page Not Found{% endblock %}</h1>
+        <h1 class="error-title">{% block heading %}Page Not Found{% endblock %}</h1>
         <p class="error-message">{% block message %}The page you're looking for doesn't exist or has been moved.{% endblock %}</p>
 
         <div class="error-actions">
             <a href="{{ url_for('main.index') if url_for else '/' }}" class="btn btn-primary">
-                🏠 Go Home
+                <i class="fas fa-home" aria-hidden="true"></i> Go Home
             </a>
             <button onclick="history.back()" class="btn btn-secondary">
-                ← Go Back
+                <i class="fas fa-arrow-left" aria-hidden="true"></i> Go Back
             </button>
         </div>
     </div>
-
-    <script>
-        // Add some interactive behavior
-        document.addEventListener('DOMContentLoaded', function() {
-            // Animate error code on load
-            const errorCode = document.querySelector('.error-code');
-            errorCode.style.transform = 'scale(0)';
-            errorCode.style.opacity = '0';
-
-            setTimeout(() => {
-                errorCode.style.transition = 'all 0.6s cubic-bezier(0.68, -0.55, 0.265, 1.55)';
-                errorCode.style.transform = 'scale(1)';
-                errorCode.style.opacity = '1';
-            }, 100);
-
-            // Add keyboard navigation
-            document.addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' || e.key === ' ') {
-                    const primaryBtn = document.querySelector('.btn-primary');
-                    if (primaryBtn) primaryBtn.click();
-                } else if (e.key === 'Escape') {
-                    history.back();
-                }
-            });
-        });
-    </script>
 </body>
 </html>

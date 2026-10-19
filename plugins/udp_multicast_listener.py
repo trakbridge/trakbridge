@@ -273,7 +273,12 @@ class UdpMulticastListener(BaseInboundPlugin):
                     placeholder="10.0.0.5, 10.0.0.6",
                     help_text=(
                         "Optional comma-separated allowlist of source IPs. "
-                        "When set, uses IGMPv3 source-specific multicast."
+                        "When set, uses IGMPv3 source-specific multicast (SSM) — "
+                        "the kernel drops datagrams from any source not listed here "
+                        "before they reach the application. This blocks spoofed or "
+                        "reflected CoT injection from unauthorized senders on the "
+                        "same multicast group. Accepts exact IPv4 addresses only "
+                        "(not CIDRs — SSM is a kernel socket option)."
                     ),
                 ),
                 PluginConfigField(
@@ -364,6 +369,54 @@ class UdpMulticastListener(BaseInboundPlugin):
                 },
             ],
         }
+
+    def validate_config(self) -> bool:
+        if not super().validate_config():
+            return False
+
+        import ipaddress
+
+        # T1.2: raise ValueError (not just return False) so
+        # update_stream_safely() surfaces the reason in the UI —
+        # matches the T1.3 pattern. Returning False alone got swallowed
+        # by the save-time hook, letting invalid configs persist.
+        group = str(self.config.get("multicast_group", "") or "")
+        if group:
+            try:
+                addr = ipaddress.ip_address(group)
+                if not addr.is_multicast:
+                    raise ValueError(
+                        f"Multicast Group '{group}' is not a multicast "
+                        "address. Use an IPv4 address in 224.0.0.0/4 "
+                        "(for example 239.2.3.1)."
+                    )
+            except ValueError as e:
+                # ip_address() raises ValueError for malformed input;
+                # our own raise above lands here too. Re-raise with a
+                # user-readable message.
+                if "is not a multicast address" in str(e):
+                    raise
+                raise ValueError(
+                    f"Multicast Group '{group}' is not a valid IP address."
+                )
+
+        source_filter = str(self.config.get("source_filter") or "")
+        if source_filter.strip():
+            for entry in source_filter.replace(",", "\n").splitlines():
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    ipaddress.ip_address(entry)
+                except ValueError:
+                    raise ValueError(
+                        f"Source Filter entry '{entry}' is not a valid "
+                        "IPv4 address. SSM requires exact source IPs, "
+                        "not CIDR blocks — for example "
+                        "'10.0.0.5, 10.0.0.6'."
+                    )
+
+        return True
 
     def transform_payload(self, raw_body, content_type, headers):
         raise NotImplementedError(

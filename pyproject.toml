@@ -46,6 +46,9 @@ dependencies = [
     "MarkupSafe",
     "marshmallow>=3.21.0,<4.0.0",
     "mgrs",
+    # msgpack floor closes GHSA-6v7p-g79w-8964 (HIGH); transitive via
+    # aiocache. Declared here so the resolver cannot pick <1.2.1.
+    "msgpack>=1.2.1",
     "multidict",
     "paho-mqtt",
     "propcache",
@@ -62,7 +65,10 @@ dependencies = [
     "python-dateutil",
     "python-dotenv",
     "PyYAML",
-    "setuptools",
+    # setuptools floor closes CVE-2025-47273 (HIGH) and CVE-2026-59890.
+    # The base image ships 70.3.0; without a floor here the resolver
+    # keeps it because "any" is already satisfied.
+    "setuptools>=83.0.0",
     "setuptools-scm",
     "six",
     "SQLAlchemy>=2.0.0,<3.0.0",
@@ -100,7 +106,8 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools>=69", "wheel", "setuptools-scm>=8.0.0"]
+# setuptools floor closes CVE-2025-47273 and CVE-2026-59890 at build time.
+requires = ["setuptools>=83.0.0", "wheel", "setuptools-scm>=8.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

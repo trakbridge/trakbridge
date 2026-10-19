@@ -674,6 +674,25 @@ class IRCHandler(BaseOutputPlugin):
         # No matching rule
         return (False, "")
 
+    @staticmethod
+    def _sanitize_irc_payload(text: str) -> str:
+        """Strip CR/LF (and NUL) from a value before it hits the IRC wire.
+
+        T5.2: IRC uses `\\r\\n` as a command separator. Untrusted CoT-derived
+        fields (callsign, remarks, group name) flow through the message
+        template unmodified; a value like `alice\\r\\nJOIN #evil` would let
+        an attacker inject arbitrary IRC commands with the bot's privileges.
+        Replace CR/LF with a single space, drop NUL bytes entirely.
+        """
+        if not text:
+            return text
+        return (
+            text.replace("\r\n", " ")
+            .replace("\r", " ")
+            .replace("\n", " ")
+            .replace("\x00", "")
+        )
+
     async def _send_to_irc(self, message: str):
         """Send message to IRC channel"""
         config = self.get_decrypted_config()
@@ -687,12 +706,20 @@ class IRCHandler(BaseOutputPlugin):
             logger.warning("Cannot send to IRC: not connected. Connection should be established at stream start.")
             return
 
+        # T5.2: sanitise once at the chokepoint. Any embedded CR/LF in
+        # the message body or the channel name would let an attacker
+        # inject IRC commands.
+        safe_message = self._sanitize_irc_payload(message)
+        safe_channel = self._sanitize_irc_payload(channel)
+
         try:
             # Send message (split long messages if needed)
             max_length = 400  # IRC message length limit
-            for i in range(0, len(message), max_length):
-                chunk = message[i : i + max_length]
-                self._writer.write(f"PRIVMSG {channel} :{chunk}\r\n".encode())
+            for i in range(0, len(safe_message), max_length):
+                chunk = safe_message[i : i + max_length]
+                self._writer.write(
+                    f"PRIVMSG {safe_channel} :{chunk}\r\n".encode()
+                )
                 await self._writer.drain()
                 logger.debug(f"Sent message to IRC: {chunk}")
 

@@ -89,6 +89,20 @@ class GenericXMLInboundPlugin(BaseInboundPlugin):
                     help_text="Secret key sent as Bearer token in the Authorization header",
                 ),
                 PluginConfigField(
+                    name="ip_allowlist",
+                    label="Source IP Allowlist",
+                    field_type="textarea",
+                    required=False,
+                    placeholder="10.0.0.0/8\n192.168.1.42\n0.0.0.0/0",
+                    help_text=(
+                        "Comma- or newline-separated IPs and/or CIDR "
+                        "blocks. Required when Authentication Mode is "
+                        "'No Authentication'. Use 0.0.0.0/0 to "
+                        "explicitly accept any IP (documents an "
+                        "intentional choice)."
+                    ),
+                ),
+                PluginConfigField(
                     name="items_xpath",
                     label="Items XPath",
                     field_type="text",
@@ -174,6 +188,42 @@ class GenericXMLInboundPlugin(BaseInboundPlugin):
                 ),
             ],
         }
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validate_config(self) -> bool:
+        if not super().validate_config():
+            return False
+
+        import ipaddress
+
+        config = self.get_decrypted_config()
+        auth_mode = str(config.get("auth_mode", "api_key")).lower()
+        allowlist = str(config.get("ip_allowlist") or "").strip()
+
+        if auth_mode == "none" and not allowlist:
+            raise ValueError(
+                "Authentication Mode 'No Authentication' requires a "
+                "non-empty Source IP Allowlist. Enter 0.0.0.0/0 to "
+                "accept any IP, or switch to API Key authentication."
+            )
+
+        if allowlist:
+            for entry in allowlist.replace(",", "\n").splitlines():
+                entry = entry.strip()
+                if not entry:
+                    continue
+                try:
+                    ipaddress.ip_network(entry, strict=False)
+                except ValueError:
+                    raise ValueError(
+                        f"Source IP Allowlist entry '{entry}' is not "
+                        "a valid IP address or CIDR block."
+                    )
+
+        return True
 
     # ------------------------------------------------------------------
     # Payload transformation

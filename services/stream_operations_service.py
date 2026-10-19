@@ -233,6 +233,24 @@ class StreamOperationsService:
             # Set plugin configuration (already extracted above)
             stream.set_plugin_config(plugin_config)
 
+            # Save-time plugin config validation. Mirrors the same probe
+            # in update_stream_safely(); without it, invalid configs
+            # (bad multicast group, missing ip_allowlist under
+            # auth_mode=none, malformed source_filter, etc.) silently
+            # persist on create and only surface when the listener tries
+            # to start. Plugin validate_config() normally returns bool;
+            # our operator-facing checks raise ValueError with a
+            # user-readable message which the existing `except
+            # (ValueError, TypeError)` block at the bottom of this
+            # method surfaces to the UI as {"success": False, "error": …}.
+            from plugins.plugin_manager import get_plugin_manager
+            pm = get_plugin_manager()
+            plugin_class = pm.get_plugin_class(stream.plugin_type)
+            if plugin_class is not None:
+                probe = plugin_class(plugin_config)
+                probe.stream = stream
+                probe.validate_config()
+
             session = self._get_session()
             session.add(stream)
             session.flush()  # Flush to get stream.id for relationships
@@ -599,6 +617,22 @@ class StreamOperationsService:
                                     merged_config[field_name] = False
 
                 stream.set_plugin_config(merged_config)
+
+                # Save-time plugin config validation. Plugin validate_config()
+                # normally returns bool, but our operator-facing checks (e.g.
+                # T1.3 auth_mode/ip_allowlist) raise ValueError with a
+                # user-readable message so the UI can surface the reason.
+                try:
+                    from plugins.plugin_manager import get_plugin_manager
+                    pm = get_plugin_manager()
+                    plugin_class = pm.get_plugin_class(stream.plugin_type)
+                    if plugin_class is not None:
+                        probe = plugin_class(merged_config)
+                        probe.stream = stream
+                        probe.validate_config()
+                except ValueError as ve:
+                    self._get_session().rollback()
+                    return {"success": False, "error": str(ve)}
 
                 # Update callsign mappings if enabled
                 if stream.enable_callsign_mapping:

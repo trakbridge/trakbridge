@@ -351,3 +351,64 @@ grep "Applied custom CoT attributes" /var/log/trakbridge/app.log
 6. **Backup**: Backup working configurations before changes
 7. **Custom CoT Review**: Audit plugins using custom_cot_attrib for proper validation
 8. **Security Monitoring**: Regularly review logs for XML injection attempts
+
+---
+
+## Plugin Signing (V1/V2)
+
+TrakBridge verifies an Ed25519 signature on every plugin it loads.
+The signing key belongs to the TrakBridge Project — the same key that
+signs licence tokens. Third-party developers can build and share
+plugins, but signed distribution goes through Emfour.
+
+### Load-time behaviour
+
+| Source | Signed | Unsigned |
+| --- | --- | --- |
+| ZIP upload via admin UI (any tier) | Installed cleanly | Community-tier: installed with an "unverified" banner. Pro/enterprise: **refused** |
+| Package directory in `external_plugins/` | Loaded cleanly | Community-tier: **refused** unless `allow_community_sideload` is on. Pro/enterprise: **always refused** |
+| Loose `.py` file in `external_plugins/` | Loaded cleanly | **Refused** unless `allow_community_sideload` is on. Never permitted for pro/enterprise (loose files carry no tier declaration) |
+
+### Enabling unsigned community-tier sideload
+
+Edit `config/settings/plugins.yaml`:
+
+```yaml
+plugin_settings:
+  # ... existing keys ...
+  allow_community_sideload: true
+```
+
+Then restart. Every unsigned load will emit a `WARNING` log line
+naming the file. This flag never permits unsigned pro or enterprise
+plugins — those must be shipped as signed packages.
+
+Recommendation: leave `allow_community_sideload: false` in production.
+Use it only in development or in CI-controlled deployments where
+every file in `external_plugins/` is guaranteed to be trusted.
+
+### Where signatures come from
+
+TrakBridge distributions of premium plugins are signed by the
+TrakBridge Project's offline signing key. The verifier's public
+half is embedded in `services/license_service.py`.
+
+Community-tier plugins produced by third-party developers are not
+signed today — they either install as unverified ZIPs (banner in
+the admin UI) or require `allow_community_sideload: true` for
+loose sideload. First-class tooling for third-party developers to
+sign their own plugins is a future item on the roadmap.
+
+### What signing protects against
+
+- Filesystem-write attackers dropping a `.py` file to gain RCE at
+  next restart.
+- Compromised distribution channels swapping a valid plugin ZIP for
+  a malicious one.
+- Accidental drift where a modified plugin loads in production
+  without anyone noticing.
+
+### What signing does NOT protect against
+
+- Bugs or bad behaviour in signed plugins. Signing proves origin,
+  not quality. Review plugin code you don't own.

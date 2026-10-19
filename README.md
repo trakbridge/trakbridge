@@ -229,4 +229,4 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 
 ---
 
-**TrakBridge v2.2.0** - Production-ready GPS tracking data bridge for TAK servers with scoped API keys, a documented REST API, self-healing connections, a public plugin SDK, inbound streams, CoT forwarding, notifications, and enterprise security, monitoring, and reliability features. Learn more at [trakbridge.io](https://trakbridge.io).
+**TrakBridge v2.2.1** - Production-ready GPS tracking data bridge for TAK servers with scoped API keys, a documented REST API, self-healing connections, a public plugin SDK, inbound streams, CoT forwarding, notifications, and enterprise security, monitoring, and reliability features. Learn more at [trakbridge.io](https://trakbridge.io).

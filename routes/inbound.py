@@ -7,6 +7,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
 import threading
 import time
 from typing import Dict, List
@@ -70,30 +71,58 @@ def _mask_api_key(key: str) -> str:
     return f"****{key[-4:]}"
 
 
-def _check_ip_allowlist(allowlist_json: str, remote_addr: str) -> bool:
+def _parse_ip_allowlist(raw: str) -> List[str]:
+    """Parse an allowlist config value into a list of IP/CIDR strings.
+
+    Accepts either legacy JSON array format (['10.0.0.0/8', ...]) or
+    newline/comma-separated free text (the format the UI now exposes).
+    JSON is tried first for backward compatibility with existing configs.
+    """
+    if not raw:
+        return []
+    text = raw.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [str(x).strip() for x in parsed if str(x).strip()]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return [
+        token.strip()
+        for token in text.replace(",", "\n").splitlines()
+        if token.strip()
+    ]
+
+
+def _check_ip_allowlist(allowlist_raw: str, remote_addr: str) -> bool:
     """
     Check if remote_addr is in the allowlist CIDRs.
 
     Args:
-        allowlist_json: JSON string of CIDR list, or None to allow all
+        allowlist_raw: Allowlist config value (JSON array or free text),
+            or None/empty to allow all
         remote_addr: Client IP address
 
     Returns:
         True if allowed, False if blocked
     """
-    if not allowlist_json:
+    if not allowlist_raw:
         return True
 
+    entries = _parse_ip_allowlist(allowlist_raw)
+    if not entries:
+        # Value was set but produced no usable entries — fail closed.
+        logger.warning("IP allowlist configured but parsed to empty list")
+        return False
+
     try:
-        cidrs = json.loads(allowlist_json)
         client_ip = ipaddress.ip_address(remote_addr)
         return any(
-            client_ip in ipaddress.ip_network(cidr, strict=False)
-            for cidr in cidrs
+            client_ip in ipaddress.ip_network(entry, strict=False)
+            for entry in entries
         )
-    except (json.JSONDecodeError, ValueError) as e:
+    except ValueError as e:
         logger.warning(f"Invalid IP allowlist config: {e}")
-        # Fail closed — if allowlist is configured but malformed, deny
         return False
 
 
@@ -107,10 +136,19 @@ def _validate_coordinates(locations: List[Dict]) -> str | None:
     for loc in locations:
         lat = loc.get("lat")
         lon = loc.get("lon")
-        if lat is not None and (lat < -90 or lat > 90):
-            return f"Invalid coordinate: latitude {lat} outside ±90 range"
-        if lon is not None and (lon < -180 or lon > 180):
-            return f"Invalid coordinate: longitude {lon} outside ±180 range"
+        # T5.4: NaN and +/-inf silently pass `<` and `>` comparisons
+        # because they return False for both. Reject them explicitly
+        # so bogus values never reach the CoT XML builder.
+        if lat is not None:
+            if not isinstance(lat, (int, float)) or not math.isfinite(lat):
+                return f"Invalid coordinate: latitude {lat!r} is not a finite number"
+            if lat < -90 or lat > 90:
+                return f"Invalid coordinate: latitude {lat} outside ±90 range"
+        if lon is not None:
+            if not isinstance(lon, (int, float)) or not math.isfinite(lon):
+                return f"Invalid coordinate: longitude {lon!r} is not a finite number"
+            if lon < -180 or lon > 180:
+                return f"Invalid coordinate: longitude {lon} outside ±180 range"
     return None
 
 

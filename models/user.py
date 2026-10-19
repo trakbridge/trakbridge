@@ -155,25 +155,74 @@ class User(db.Model, TimestampMixin):
             password.encode("utf-8"), self.password_hash.encode("utf-8")
         )
 
+    def _lockout_expired(self) -> bool:
+        """True when `locked_until` is set and has already passed."""
+        if not self.locked_until:
+            return False
+        current_time = datetime.now(timezone.utc)
+        locked_until = self.locked_until
+        if locked_until.tzinfo is None:
+            # Naive timestamps from the DB are assumed to be UTC.
+            locked_until = locked_until.replace(tzinfo=timezone.utc)
+        return locked_until <= current_time
+
+    def _auto_unlock_if_expired(self) -> bool:
+        """Lazy auto-unlock: if the lockout window has passed, clear it
+        and flip status back to ACTIVE. Returns True when an unlock
+        actually happened so the caller can commit.
+
+        Called from `is_active()` and `is_locked()` so the very next
+        login attempt after the window expires sees a clean account,
+        without needing a background scheduler.
+        """
+        if not self._lockout_expired():
+            return False
+        self.locked_until = None
+        self.failed_login_attempts = 0
+        if self.status == AccountStatus.LOCKED:
+            self.status = AccountStatus.ACTIVE
+        return True
+
+    def _persist_auto_unlock(self) -> None:
+        """Commit a lazy auto-unlock, best-effort.
+
+        Called from `is_active()` / `is_locked()` after the mutation.
+        Kept private and best-effort because these accessors get called
+        in many contexts (templates, log lines) where a failed commit
+        should not raise. The next successful commit will pick up the
+        change anyway; this just persists it eagerly.
+        """
+        try:
+            from database import db
+            db.session.commit()
+        except Exception:
+            try:
+                from database import db
+                db.session.rollback()
+            except Exception:
+                pass
+
     def is_active(self) -> bool:
         """Check if user account is active"""
+        # Lazy auto-unlock: an expired lockout should not keep the
+        # account inactive. Runs before the status check because a
+        # LOCKED account whose window has passed becomes ACTIVE here.
+        if self._auto_unlock_if_expired():
+            self._persist_auto_unlock()
+
         if self.status != AccountStatus.ACTIVE:
             return False
-
-        # Check if account is temporarily locked
-        if self.locked_until:
-            current_time = datetime.now(timezone.utc)
-            locked_until = self.locked_until
-            if locked_until.tzinfo is None:
-                # If locked_until is naive, assume it's UTC
-                locked_until = locked_until.replace(tzinfo=timezone.utc)
-            if locked_until > current_time:
-                return False
 
         return True
 
     def is_locked(self) -> bool:
         """Check if user account is locked"""
+        # Lazy auto-unlock: if the lockout window has passed, drop the
+        # LOCKED status so subsequent checks report the account as free.
+        if self._auto_unlock_if_expired():
+            self._persist_auto_unlock()
+            return False
+
         if self.status == AccountStatus.LOCKED:
             return True
 
@@ -181,7 +230,6 @@ class User(db.Model, TimestampMixin):
             current_time = datetime.now(timezone.utc)
             locked_until = self.locked_until
             if locked_until.tzinfo is None:
-                # If locked_until is naive, assume it's UTC
                 locked_until = locked_until.replace(tzinfo=timezone.utc)
             return locked_until > current_time
 

@@ -24,12 +24,19 @@ allowed_plugin_modules:
 plugin_settings:
   # Whether to automatically scan for new plugins on startup
   auto_discovery: true
-  
+
   # Maximum number of plugins to load (safety limit)
   max_plugins: 50
-  
+
   # Whether to validate plugin signatures (future feature)
   validate_signatures: false
+
+  # Allow sideloading of UNSIGNED community-tier plugins from
+  # external_plugins/ at startup. Signed plugins are always loaded.
+  # Pro/enterprise plugins are ALWAYS refused if unsigned regardless
+  # of this setting. Default false. Set true only if you trust every
+  # file in external_plugins/ (e.g. private CI-controlled deploys).
+  allow_community_sideload: false
 
 # Development settings (only effective in development mode)
 development:
